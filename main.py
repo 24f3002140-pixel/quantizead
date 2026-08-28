@@ -10,7 +10,6 @@ from fastapi.responses import JSONResponse
 
 app = FastAPI()
 
-# Stateful storage for the lifetime of the service.
 FREEZES: dict[str, dict[str, Any]] = {}
 
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
@@ -144,37 +143,31 @@ def validate_freeze_global(body):
             return False
         names.add(name)
 
-        # Check files - must be a dict (can be empty)
+        # files must be a dict (can be empty)
         files = c.get("files")
-        if files is None or not isinstance(files, dict):
+        if not isinstance(files, dict):
             return False
-        
-        # Validate filenames if present
+
+        # If files has content, validate filenames
         for filename, text in files.items():
             if not nonempty_string(filename):
                 return False
             if not isinstance(text, str):
                 return False
 
-        # loadable must be present and boolean
-        if "loadable" not in c:
-            return False
-        if not isinstance(c["loadable"], bool):
+        if "loadable" not in c or not isinstance(c["loadable"], bool):
             return False
 
-        # calibrationDigest must be present and non-empty
         if "calibrationDigest" not in c:
             return False
         if not nonempty_string(c.get("calibrationDigest")):
             return False
 
-        # tokenizerDigest must be present and non-empty
         if "tokenizerDigest" not in c:
             return False
         if not nonempty_string(c.get("tokenizerDigest")):
             return False
 
-        # unsupportedReason is optional
         if "unsupportedReason" in c:
             reason = c.get("unsupportedReason")
             if reason is not None and not nonempty_string(reason):
@@ -210,10 +203,10 @@ def freeze_candidate(candidate, request_cal, request_tok, allowed):
     cand_tok = candidate["tokenizerDigest"]
     reason = candidate.get("unsupportedReason")
 
-    # Build artifact inventory
+    # Build inventory
     inventory, total_bytes, digest = build_inventory(files)
 
-    # If files is empty, return invalid immediately
+    # Case 1: Empty files -> invalid with empty inventory
     if len(files) == 0:
         return {
             "name": name,
@@ -226,7 +219,7 @@ def freeze_candidate(candidate, request_cal, request_tok, allowed):
 
     codes = []
 
-    # Check unsupported reason
+    # Case 2: Has unsupportedReason
     if reason is not None and reason != "":
         if reason in allowed:
             return {
@@ -248,7 +241,7 @@ def freeze_candidate(candidate, request_cal, request_tok, allowed):
             "reasonCodes": codes,
         }
 
-    # Check loadable and digests
+    # Case 3: Normal validation
     if not loadable:
         codes.append("NOT_LOADABLE")
 
@@ -285,13 +278,11 @@ def do_freeze(body):
 
     if freeze_id in FREEZES:
         old = FREEZES[freeze_id]
-
         if canonical_equal(old["input"], body):
             return JSONResponse(
                 status_code=200,
                 content=deepcopy(old["response"]),
             )
-
         return error_response("FREEZE_ID_CONFLICT", 409)
 
     request_cal = body["calibrationDigest"]
@@ -299,7 +290,6 @@ def do_freeze(body):
     allowed = set(body["allowedUnsupportedReasons"])
 
     results = []
-
     for candidate in body["candidates"]:
         results.append(
             freeze_candidate(
@@ -435,7 +425,6 @@ def validate_manifest(candidate):
 def get_lineage_info(stored_candidates, submitted_candidates):
     if not isinstance(submitted_candidates, list):
         return False
-
     return canonical_equal(stored_candidates, submitted_candidates)
 
 
@@ -730,7 +719,6 @@ async def quantize(request: Request):
     if phase == "freeze":
         if not validate_freeze_global(body):
             return error_response("INVALID_INPUT", 400)
-
         return do_freeze(body)
 
     # SELECT phase
