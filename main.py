@@ -2,11 +2,16 @@ import json
 import hashlib
 import math
 import re
+import logging
 from copy import deepcopy
 from typing import Any
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
+
+# Set up logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 app = FastAPI()
 
@@ -16,6 +21,7 @@ SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 
 
 def error_response(code: str, status: int = 400):
+    logger.error(f"Returning error: {code} with status {status}")
     return JSONResponse(
         status_code=status,
         content={"error": code},
@@ -98,9 +104,10 @@ def canonical_equal(a, b):
 
 
 # ------------------------------------------------------------
-# FREEZE VALIDATION (FIXED: allows empty files dict)
+# FREEZE - very permissive validation
 # ------------------------------------------------------------
 def validate_freeze_global(body):
+    """Only check overall structure; let freeze_candidate handle per-candidate errors."""
     if not isinstance(body, dict):
         return False
 
@@ -108,69 +115,54 @@ def validate_freeze_global(body):
         return False
 
     freeze_id = body.get("freezeId")
-    if not isinstance(freeze_id, str):
-        return False
-    if len(freeze_id) == 0 or len(freeze_id) > 128:
+    if not isinstance(freeze_id, str) or len(freeze_id) == 0 or len(freeze_id) > 128:
+        logger.error(f"Invalid freezeId: {freeze_id}")
         return False
 
     if not nonempty_string(body.get("calibrationDigest")):
+        logger.error("Missing calibrationDigest")
         return False
 
     if not nonempty_string(body.get("tokenizerDigest")):
+        logger.error("Missing tokenizerDigest")
         return False
 
     allowed = body.get("allowedUnsupportedReasons")
+    if not isinstance(allowed, list):
+        logger.error("allowedUnsupportedReasons not a list")
+        return False
+    # Allow empty list; unique_strings will handle uniqueness
     if not unique_strings(allowed):
+        logger.error("allowedUnsupportedReasons invalid")
         return False
 
     candidates = body.get("candidates")
-
     if not isinstance(candidates, list) or len(candidates) == 0:
+        logger.error("candidates is empty or not a list")
         return False
 
+    # Check that each candidate has a name (must be non-empty and unique)
     names = set()
-
     for c in candidates:
         if not isinstance(c, dict):
+            logger.error("Candidate not a dict")
             return False
-
         name = c.get("name")
         if not nonempty_string(name):
+            logger.error("Candidate name missing or empty")
             return False
-
         if name in names:
+            logger.error(f"Duplicate candidate name: {name}")
             return False
         names.add(name)
 
-        # FIX: Allow empty dict, but ensure it's a dict
+        # Minimal check: files must exist and be a dict (can be empty)
         files = c.get("files")
         if not isinstance(files, dict):
+            logger.error(f"files not a dict for {name}")
             return False
 
-        # Only validate filenames if there are any
-        for filename, text in files.items():
-            if not nonempty_string(filename):
-                return False
-            if not isinstance(text, str):
-                return False
-
-        if "loadable" not in c or not isinstance(c["loadable"], bool):
-            return False
-
-        if "calibrationDigest" not in c:
-            return False
-        if not nonempty_string(c.get("calibrationDigest")):
-            return False
-
-        if "tokenizerDigest" not in c:
-            return False
-        if not nonempty_string(c.get("tokenizerDigest")):
-            return False
-
-        if "unsupportedReason" in c:
-            reason = c.get("unsupportedReason")
-            if reason is not None and not nonempty_string(reason):
-                return False
+        # Other fields are optional; freeze_candidate will handle them
 
     return True
 
@@ -195,16 +187,37 @@ def build_inventory(files):
 
 
 def freeze_candidate(candidate, request_cal, request_tok, allowed):
-    name = candidate["name"]
-    files = candidate["files"]
-    loadable = candidate["loadable"]
-    cand_cal = candidate["calibrationDigest"]
-    cand_tok = candidate["tokenizerDigest"]
-    reason = candidate.get("unsupportedReason")
+    """
+    Process a single candidate. Any error marks it as invalid with empty inventory.
+    """
+    name = candidate.get("name", "")
+    if not nonempty_string(name):
+        # This should not happen because validation ensures name exists
+        return {
+            "name": "unknown",
+            "status": "invalid",
+            "inventory": [],
+            "totalBytes": None,
+            "packageDigest": None,
+            "reasonCodes": ["INVALID_INPUT"],
+        }
 
+    files = candidate.get("files")
+    if not isinstance(files, dict):
+        # Malformed files -> invalid
+        return {
+            "name": name,
+            "status": "invalid",
+            "inventory": [],
+            "totalBytes": None,
+            "packageDigest": None,
+            "reasonCodes": [],
+        }
+
+    # Build inventory (works even if files is empty)
     inventory, total_bytes, digest = build_inventory(files)
 
-    # Empty files -> invalid with empty inventory
+    # If files is empty, mark as invalid with empty inventory
     if len(files) == 0:
         return {
             "name": name,
@@ -215,8 +228,15 @@ def freeze_candidate(candidate, request_cal, request_tok, allowed):
             "reasonCodes": [],
         }
 
+    # Get other fields with defaults
+    loadable = candidate.get("loadable", False)
+    cand_cal = candidate.get("calibrationDigest", "")
+    cand_tok = candidate.get("tokenizerDigest", "")
+    reason = candidate.get("unsupportedReason")
+
     codes = []
 
+    # Check unsupported reason
     if reason is not None and reason != "":
         if reason in allowed:
             return {
@@ -238,6 +258,7 @@ def freeze_candidate(candidate, request_cal, request_tok, allowed):
             "reasonCodes": codes,
         }
 
+    # Normal validation
     if not loadable:
         codes.append("NOT_LOADABLE")
 
@@ -259,6 +280,7 @@ def freeze_candidate(candidate, request_cal, request_tok, allowed):
             "reasonCodes": codes,
         }
 
+    # Valid candidate
     return {
         "name": name,
         "status": "frozen",
@@ -272,18 +294,21 @@ def freeze_candidate(candidate, request_cal, request_tok, allowed):
 def do_freeze(body):
     freeze_id = body["freezeId"]
 
+    # Check for ID conflict
     if freeze_id in FREEZES:
         old = FREEZES[freeze_id]
         if canonical_equal(old["input"], body):
+            logger.info(f"Replaying identical freezeId {freeze_id}")
             return JSONResponse(
                 status_code=200,
                 content=deepcopy(old["response"]),
             )
+        logger.warning(f"Conflict on freezeId {freeze_id}")
         return error_response("FREEZE_ID_CONFLICT", 409)
 
     request_cal = body["calibrationDigest"]
     request_tok = body["tokenizerDigest"]
-    allowed = set(body["allowedUnsupportedReasons"])
+    allowed = set(body.get("allowedUnsupportedReasons", []))
 
     results = []
     for candidate in body["candidates"]:
@@ -308,11 +333,12 @@ def do_freeze(body):
         "response": deepcopy(response),
     }
 
+    logger.info(f"Froze {freeze_id} with {len(results)} candidates")
     return JSONResponse(status_code=200, content=response)
 
 
 # ------------------------------------------------------------
-# SELECT
+# SELECT - keep as before, but with logging
 # ------------------------------------------------------------
 def validate_policy(policy):
     if not isinstance(policy, dict):
@@ -503,27 +529,32 @@ def do_select(body):
     freeze_id = body.get("freezeId")
 
     if not isinstance(freeze_id, str) or not freeze_id:
+        logger.error("freezeId missing or empty")
         return error_response("INVALID_INPUT", 400)
 
     stored = FREEZES.get(freeze_id)
 
     if stored is None:
+        logger.error(f"freezeId {freeze_id} not found")
         return error_response("NOT_FROZEN", 400)
 
     submitted_candidates = body.get("candidates")
     
     if not isinstance(submitted_candidates, list) or len(submitted_candidates) == 0:
+        logger.error("candidates is empty or not a list")
         return error_response("INVALID_INPUT", 400)
 
     if not get_lineage_info(
         stored["response"]["candidates"],
         submitted_candidates,
     ):
+        logger.error("Lineage mismatch")
         return error_response("INVALID_LINEAGE", 400)
 
     policy = body.get("policy")
 
     if not validate_policy(policy):
+        logger.error("Policy validation failed")
         return error_response("INVALID_POLICY", 400)
 
     candidate_order = policy["candidateOrder"]
@@ -544,16 +575,19 @@ def do_select(body):
         or set(stored_names) != set(submitted_names)
         or set(stored_names) != set(candidate_order)
     ):
+        logger.error(f"Name mismatch. stored: {stored_names}, submitted: {submitted_names}, order: {candidate_order}")
         return error_response("INVALID_POLICY", 400)
 
     latencies = body.get("latencies")
 
     if not isinstance(latencies, dict):
+        logger.error("latencies is not a dict")
         return error_response("INVALID_POLICY", 400)
 
     rows = body.get("rows")
 
     if not isinstance(rows, list) or len(rows) == 0:
+        logger.error("rows is empty or not a list")
         return error_response("INVALID_INPUT", 400)
 
     results = []
@@ -686,6 +720,7 @@ def do_select(body):
         "packageManifest": package_manifest,
     }
 
+    logger.info(f"Select completed for {freeze_id}, selected: {selected}")
     return JSONResponse(
         status_code=200,
         content=response,
@@ -693,25 +728,31 @@ def do_select(body):
 
 
 # ------------------------------------------------------------
-# ENDPOINT
+# MAIN ENDPOINT
 # ------------------------------------------------------------
 @app.post("/quantize")
 async def quantize(request: Request):
     try:
         body = await request.json()
-    except Exception:
+        logger.info(f"Received request: {json.dumps(body, indent=2)[:500]}")  # Log first 500 chars
+    except Exception as e:
+        logger.error(f"Failed to parse JSON: {e}")
         return error_response("INVALID_INPUT", 400)
 
     if not isinstance(body, dict):
+        logger.error("Body is not a dict")
         return error_response("INVALID_INPUT", 400)
 
     phase = body.get("phase")
+    logger.info(f"Phase: {phase}")
 
     if phase not in {"freeze", "select"}:
+        logger.error(f"Unknown phase: {phase}")
         return error_response("INVALID_INPUT", 400)
 
     if phase == "freeze":
         if not validate_freeze_global(body):
+            logger.error("Freeze validation failed")
             return error_response("INVALID_INPUT", 400)
         return do_freeze(body)
 
@@ -729,6 +770,7 @@ async def quantize(request: Request):
         or "freezeId" not in body
         or "latencies" not in body
     ):
+        logger.error("Select request malformed")
         return error_response("INVALID_INPUT", 400)
 
     return do_select(body)
