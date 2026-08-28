@@ -569,7 +569,7 @@ def do_select(body):
     stored = FREEZES.get(freeze_id)
 
     if stored is None:
-        return error_response("INVALID_INPUT", 400)
+        return error_response("NOT_FROZEN", 400)
 
     submitted_candidates = body["candidates"]
 
@@ -578,12 +578,12 @@ def do_select(body):
         stored["response"]["candidates"],
         submitted_candidates,
     ):
-        return error_response("INVALID_INPUT", 400)
+        return error_response("INVALID_LINEAGE", 400)
 
     policy = body["policy"]
 
     if not validate_policy(policy):
-        return error_response("INVALID_INPUT", 400)
+        return error_response("INVALID_POLICY", 400)
 
     candidate_order = policy["candidateOrder"]
 
@@ -603,12 +603,12 @@ def do_select(body):
         or set(stored_names) != set(submitted_names)
         or set(stored_names) != set(candidate_order)
     ):
-        return error_response("INVALID_INPUT", 400)
+        return error_response("INVALID_POLICY", 400)
 
     latencies = body["latencies"]
 
     if not isinstance(latencies, dict):
-        return error_response("INVALID_INPUT", 400)
+        return error_response("INVALID_POLICY", 400)
 
     rows = body["rows"]
 
