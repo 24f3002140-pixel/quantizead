@@ -4,9 +4,14 @@ import math
 import re
 from copy import deepcopy
 from typing import Any
+import logging
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
+
+# Add logging
+logging.basicConfig(level=logging.DEBUG)
+logger = logging.getLogger(__name__)
 
 app = FastAPI()
 
@@ -36,6 +41,7 @@ SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 
 
 def error_response(code: str, status: int = 400):
+    logger.error(f"Returning error: {code} with status {status}")
     return JSONResponse(
         status_code=status,
         content={"error": code},
@@ -563,25 +569,34 @@ def do_select(body):
     freeze_id = body.get("freezeId")
 
     if not isinstance(freeze_id, str) or not freeze_id:
+        logger.error("freezeId missing or empty")
         return error_response("INVALID_INPUT", 400)
 
     stored = FREEZES.get(freeze_id)
 
     if stored is None:
+        logger.error(f"freezeId {freeze_id} not found")
         return error_response("NOT_FROZEN", 400)
 
     submitted_candidates = body.get("candidates")
+    
+    # CRITICAL: Validate candidates is a non-empty list
+    if not isinstance(submitted_candidates, list) or len(submitted_candidates) == 0:
+        logger.error("candidates is empty or not a list")
+        return error_response("INVALID_INPUT", 400)
 
     # The supplied candidates must exactly equal the stored response.
     if not get_lineage_info(
         stored["response"]["candidates"],
         submitted_candidates,
     ):
+        logger.error("Lineage mismatch")
         return error_response("INVALID_LINEAGE", 400)
 
     policy = body.get("policy")
 
     if not validate_policy(policy):
+        logger.error("Policy validation failed")
         return error_response("INVALID_POLICY", 400)
 
     candidate_order = policy["candidateOrder"]
@@ -602,16 +617,19 @@ def do_select(body):
         or set(stored_names) != set(submitted_names)
         or set(stored_names) != set(candidate_order)
     ):
+        logger.error(f"Name mismatch. stored: {stored_names}, submitted: {submitted_names}, order: {candidate_order}")
         return error_response("INVALID_POLICY", 400)
 
     latencies = body.get("latencies")
 
     if not isinstance(latencies, dict):
+        logger.error("latencies is not a dict")
         return error_response("INVALID_POLICY", 400)
 
     rows = body.get("rows")
 
     if not isinstance(rows, list) or len(rows) == 0:
+        logger.error("rows is empty or not a list")
         return error_response("INVALID_INPUT", 400)
 
     results = []
@@ -773,16 +791,21 @@ def do_select(body):
 async def quantize(request: Request):
     try:
         body = await request.json()
-    except Exception:
+        logger.debug(f"Received request: {json.dumps(body, indent=2)}")
+    except Exception as e:
+        logger.error(f"Failed to parse JSON: {e}")
         return error_response("INVALID_INPUT", 400)
 
     if not isinstance(body, dict):
+        logger.error("Body is not a dict")
         return error_response("INVALID_INPUT", 400)
 
     phase = body.get("phase")
+    logger.info(f"Phase: {phase}")
 
     # Unknown/missing phase.
     if phase not in {"freeze", "select"}:
+        logger.error(f"Unknown phase: {phase}")
         return error_response("INVALID_INPUT", 400)
 
     # ---------------- FREEZE ----------------
@@ -790,6 +813,7 @@ async def quantize(request: Request):
         # IMPORTANT:
         # Invalid freeze input must NOT reserve freezeId.
         if not validate_freeze_global(body):
+            logger.error("Freeze validation failed")
             return error_response("INVALID_INPUT", 400)
 
         return do_freeze(body)
@@ -801,19 +825,44 @@ async def quantize(request: Request):
     policy = body.get("policy")
 
     # Check for missing or empty arrays
-    if candidates is None or not isinstance(candidates, list) or len(candidates) == 0:
+    if candidates is None:
+        logger.error("candidates is None")
         return error_response("INVALID_INPUT", 400)
     
-    if rows is None or not isinstance(rows, list) or len(rows) == 0:
+    if not isinstance(candidates, list):
+        logger.error(f"candidates is not a list: {type(candidates)}")
         return error_response("INVALID_INPUT", 400)
     
-    if policy is None or not isinstance(policy, dict):
+    if len(candidates) == 0:
+        logger.error("candidates is empty")
+        return error_response("INVALID_INPUT", 400)
+    
+    if rows is None:
+        logger.error("rows is None")
+        return error_response("INVALID_INPUT", 400)
+    
+    if not isinstance(rows, list):
+        logger.error(f"rows is not a list: {type(rows)}")
+        return error_response("INVALID_INPUT", 400)
+    
+    if len(rows) == 0:
+        logger.error("rows is empty")
+        return error_response("INVALID_INPUT", 400)
+    
+    if policy is None:
+        logger.error("policy is None")
+        return error_response("INVALID_INPUT", 400)
+    
+    if not isinstance(policy, dict):
+        logger.error(f"policy is not a dict: {type(policy)}")
         return error_response("INVALID_INPUT", 400)
     
     if "freezeId" not in body:
+        logger.error("freezeId missing")
         return error_response("INVALID_INPUT", 400)
     
     if "latencies" not in body:
+        logger.error("latencies missing")
         return error_response("INVALID_INPUT", 400)
 
     return do_select(body)
