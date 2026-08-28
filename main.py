@@ -97,6 +97,9 @@ def canonical_equal(a, b):
     return a == b
 
 
+# ------------------------------------------------------------
+# FREEZE VALIDATION (FIXED: allows empty files dict)
+# ------------------------------------------------------------
 def validate_freeze_global(body):
     if not isinstance(body, dict):
         return False
@@ -139,10 +142,12 @@ def validate_freeze_global(body):
             return False
         names.add(name)
 
+        # FIX: Allow empty dict, but ensure it's a dict
         files = c.get("files")
         if not isinstance(files, dict):
             return False
 
+        # Only validate filenames if there are any
         for filename, text in files.items():
             if not nonempty_string(filename):
                 return False
@@ -199,6 +204,7 @@ def freeze_candidate(candidate, request_cal, request_tok, allowed):
 
     inventory, total_bytes, digest = build_inventory(files)
 
+    # Empty files -> invalid with empty inventory
     if len(files) == 0:
         return {
             "name": name,
@@ -305,6 +311,9 @@ def do_freeze(body):
     return JSONResponse(status_code=200, content=response)
 
 
+# ------------------------------------------------------------
+# SELECT
+# ------------------------------------------------------------
 def validate_policy(policy):
     if not isinstance(policy, dict):
         return False
@@ -683,6 +692,9 @@ def do_select(body):
     )
 
 
+# ------------------------------------------------------------
+# ENDPOINT
+# ------------------------------------------------------------
 @app.post("/quantize")
 async def quantize(request: Request):
     try:
@@ -703,6 +715,7 @@ async def quantize(request: Request):
             return error_response("INVALID_INPUT", 400)
         return do_freeze(body)
 
+    # SELECT phase
     candidates = body.get("candidates")
     rows = body.get("rows")
     policy = body.get("policy")
