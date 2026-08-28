@@ -4,52 +4,23 @@ import math
 import re
 from copy import deepcopy
 from typing import Any
-import logging
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
-
-# Add logging
-logging.basicConfig(level=logging.DEBUG)
-logger = logging.getLogger(__name__)
 
 app = FastAPI()
 
 # Stateful storage for the lifetime of the service.
 FREEZES: dict[str, dict[str, Any]] = {}
 
-FREEZE_CODES = {
-    "INVALID_INPUT",
-    "UNALLOWED_UNSUPPORTED_REASON",
-    "NOT_LOADABLE",
-    "CALIBRATION_MISMATCH",
-    "TOKENIZER_MISMATCH",
-}
-
-SELECT_CODES = {
-    "NOT_FROZEN",
-    "INVALID_LINEAGE",
-    "INVALID_POLICY",
-    "INVALID_PREDICTIONS",
-    "INVALID_MANIFEST",
-    "AGGREGATE_FLOOR",
-    "SIZE_LIMIT",
-    "LATENCY_LIMIT",
-}
-
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 
 
 def error_response(code: str, status: int = 400):
-    logger.error(f"Returning error: {code} with status {status}")
     return JSONResponse(
         status_code=status,
         content={"error": code},
     )
-
-
-def is_string(x):
-    return isinstance(x, str)
 
 
 def nonempty_string(x):
@@ -63,21 +34,17 @@ def utf8_key(x):
 def unique_strings(values):
     if not isinstance(values, list):
         return False
-
     seen = set()
-
     for x in values:
         if not nonempty_string(x):
             return False
         if x in seen:
             return False
         seen.add(x)
-
     return True
 
 
 def safe_nonnegative_int(x):
-    # bool is an int subclass in Python, but must not count as a number here.
     return (
         isinstance(x, int)
         and not isinstance(x, bool)
@@ -104,8 +71,6 @@ def valid_floor(x):
 
 
 def compact_json_bytes(obj):
-    # Equivalent to compact JSON.stringify for ordinary JSON data,
-    # with literal UTF-8 characters.
     return json.dumps(
         obj,
         ensure_ascii=False,
@@ -130,7 +95,6 @@ def sorted_codes(codes):
 
 
 def canonical_equal(a, b):
-    # JSON structural equality.
     return a == b
 
 
@@ -163,7 +127,6 @@ def validate_freeze_global(body):
 
     candidates = body.get("candidates")
 
-    # CRITICAL: empty freeze candidate list is globally invalid.
     if not isinstance(candidates, list) or len(candidates) == 0:
         return False
 
@@ -182,23 +145,20 @@ def validate_freeze_global(body):
         names.add(name)
 
         files = c.get("files")
-        if not isinstance(files, dict) or len(files) == 0:
+        # Allow empty files, but validate it's a dict
+        if not isinstance(files, dict):
             return False
-
-        # JSON objects already have unique keys after parsing.
-        # Every filename must be a non-empty string and every file value
-        # must be a string (which represents UTF-8 text).
+        
+        # Only validate filenames if files has content
         for filename, text in files.items():
             if not nonempty_string(filename):
                 return False
             if not isinstance(text, str):
                 return False
 
-        # loadable must be boolean when supplied.
         if "loadable" not in c or not isinstance(c["loadable"], bool):
             return False
 
-        # Candidate digests must be non-empty strings when supplied.
         if "calibrationDigest" not in c:
             return False
         if not nonempty_string(c.get("calibrationDigest")):
@@ -209,8 +169,6 @@ def validate_freeze_global(body):
         if not nonempty_string(c.get("tokenizerDigest")):
             return False
 
-        # unsupportedReason may be omitted/null/empty.
-        # If present as a value, it must be a non-empty string.
         if "unsupportedReason" in c:
             reason = c.get("unsupportedReason")
             if reason is not None and not nonempty_string(reason):
@@ -251,6 +209,17 @@ def freeze_candidate(candidate, request_cal, request_tok, allowed):
     # Build artifact inventory first.
     inventory, total_bytes, digest = build_inventory(files)
 
+    # If files is empty, mark as invalid with empty inventory
+    if len(files) == 0:
+        return {
+            "name": name,
+            "status": "invalid",
+            "inventory": [],
+            "totalBytes": None,
+            "packageDigest": None,
+            "reasonCodes": [],
+        }
+
     # An explicit unsupported reason which is allowed means unsupported.
     if reason is not None and reason != "":
         if reason in allowed:
@@ -263,7 +232,6 @@ def freeze_candidate(candidate, request_cal, request_tok, allowed):
                 "reasonCodes": [],
             }
 
-        # Not an allowed unsupported reason.
         codes.append("UNALLOWED_UNSUPPORTED_REASON")
         codes = sorted_codes(codes)
 
@@ -276,7 +244,6 @@ def freeze_candidate(candidate, request_cal, request_tok, allowed):
             "reasonCodes": codes,
         }
 
-    # No unsupported reason: candidate must be loadable and lineage must match.
     if not loadable:
         codes.append("NOT_LOADABLE")
 
@@ -311,8 +278,6 @@ def freeze_candidate(candidate, request_cal, request_tok, allowed):
 def do_freeze(body):
     freeze_id = body["freezeId"]
 
-    # Existing ID: identical input must replay unchanged.
-    # Different input must conflict.
     if freeze_id in FREEZES:
         old = FREEZES[freeze_id]
 
@@ -347,7 +312,6 @@ def do_freeze(body):
         "candidates": results,
     }
 
-    # Only reserve ID after ALL global validation has succeeded.
     FREEZES[freeze_id] = {
         "input": deepcopy(body),
         "response": deepcopy(response),
@@ -403,21 +367,6 @@ def validate_policy(policy):
 
 
 def validate_manifest(candidate):
-    """
-    Recompute the manifest from the supplied inventory.
-
-    The grader supplies the frozen candidate response. We cannot recreate
-    the original file contents during select, so integrity is checked from
-    the recorded inventory itself:
-      - names valid/non-empty
-      - unique
-      - sorted
-      - bytes safe integers
-      - sha256 lowercase 64 hex
-      - totalBytes equals sum
-      - packageDigest equals SHA-256(compact JSON inventory)
-    """
-
     if not isinstance(candidate, dict):
         return False
 
@@ -438,7 +387,6 @@ def validate_manifest(candidate):
         if not isinstance(item, dict):
             return False
 
-        # Exact manifest keys expected.
         if set(item.keys()) != {"name", "bytes", "sha256"}:
             return False
 
@@ -483,12 +431,10 @@ def get_lineage_info(stored_candidates, submitted_candidates):
     if not isinstance(submitted_candidates, list):
         return False
 
-    # Must exactly equal stored frozen candidate array.
     return canonical_equal(stored_candidates, submitted_candidates)
 
 
 def prediction_is_binary(value):
-    # JSON boolean is not a binary prediction.
     return (
         isinstance(value, int)
         and not isinstance(value, bool)
@@ -504,7 +450,6 @@ def evaluate_candidate(candidate, rows, required_slices):
 
     prediction_invalid = False
 
-    # Validate every row first.
     valid_rows = []
 
     for row in rows:
@@ -569,34 +514,27 @@ def do_select(body):
     freeze_id = body.get("freezeId")
 
     if not isinstance(freeze_id, str) or not freeze_id:
-        logger.error("freezeId missing or empty")
         return error_response("INVALID_INPUT", 400)
 
     stored = FREEZES.get(freeze_id)
 
     if stored is None:
-        logger.error(f"freezeId {freeze_id} not found")
         return error_response("NOT_FROZEN", 400)
 
     submitted_candidates = body.get("candidates")
     
-    # CRITICAL: Validate candidates is a non-empty list
     if not isinstance(submitted_candidates, list) or len(submitted_candidates) == 0:
-        logger.error("candidates is empty or not a list")
         return error_response("INVALID_INPUT", 400)
 
-    # The supplied candidates must exactly equal the stored response.
     if not get_lineage_info(
         stored["response"]["candidates"],
         submitted_candidates,
     ):
-        logger.error("Lineage mismatch")
         return error_response("INVALID_LINEAGE", 400)
 
     policy = body.get("policy")
 
     if not validate_policy(policy):
-        logger.error("Policy validation failed")
         return error_response("INVALID_POLICY", 400)
 
     candidate_order = policy["candidateOrder"]
@@ -617,19 +555,16 @@ def do_select(body):
         or set(stored_names) != set(submitted_names)
         or set(stored_names) != set(candidate_order)
     ):
-        logger.error(f"Name mismatch. stored: {stored_names}, submitted: {submitted_names}, order: {candidate_order}")
         return error_response("INVALID_POLICY", 400)
 
     latencies = body.get("latencies")
 
     if not isinstance(latencies, dict):
-        logger.error("latencies is not a dict")
         return error_response("INVALID_POLICY", 400)
 
     rows = body.get("rows")
 
     if not isinstance(rows, list) or len(rows) == 0:
-        logger.error("rows is empty or not a list")
         return error_response("INVALID_INPUT", 400)
 
     results = []
@@ -639,17 +574,14 @@ def do_select(body):
 
         codes = []
 
-        # Manifest validation.
         manifest_valid = validate_manifest(candidate)
 
-        # Only a genuinely frozen candidate can be admitted.
         if candidate.get("status") != "frozen":
             codes.append("INVALID_LINEAGE")
 
         if not manifest_valid:
             codes.append("INVALID_MANIFEST")
 
-        # Validate latency.
         latency_valid = False
         latency_value = None
 
@@ -660,11 +592,9 @@ def do_select(body):
                 latency_valid = True
                 latency_value = float(lv)
 
-                # Preserve integer-looking latency as integer.
                 if isinstance(lv, int) and not isinstance(lv, bool):
                     latency_value = lv
 
-        # Evaluate predictions.
         aggregate, slices, prediction_invalid = evaluate_candidate(
             candidate,
             rows,
@@ -674,7 +604,6 @@ def do_select(body):
         if prediction_invalid:
             codes.append("INVALID_PREDICTIONS")
 
-        # Floors.
         if aggregate is not None:
             if aggregate < float(policy["aggregateFloor"]):
                 codes.append("AGGREGATE_FLOOR")
@@ -685,7 +614,6 @@ def do_select(body):
                 elif slices[slice_name] < float(floor):
                     codes.append(f"SLICE_FLOOR:{slice_name}")
 
-        # Size.
         total_bytes = None
 
         if manifest_valid:
@@ -694,12 +622,10 @@ def do_select(body):
             if total_bytes > policy["maxBytes"]:
                 codes.append("SIZE_LIMIT")
 
-        # Latency.
         if latency_valid:
             if latency_value > float(policy["maxLatencyMs"]):
                 codes.append("LATENCY_LIMIT")
         else:
-            # An invalid/missing latency cannot pass admission.
             codes.append("LATENCY_LIMIT")
 
         codes = sorted_codes(codes)
@@ -716,7 +642,6 @@ def do_select(body):
             "reasonCodes": codes,
         })
 
-    # Results follow candidateOrder.
     order_index = {
         name: i
         for i, name in enumerate(candidate_order)
@@ -732,10 +657,6 @@ def do_select(body):
         )
     )
 
-    # Select admitted candidate:
-    # 1. smaller bytes
-    # 2. lower latency
-    # 3. candidateOrder
     admitted_results = [
         r for r in results
         if r["admitted"]
@@ -757,7 +678,6 @@ def do_select(body):
 
         selected = winner["name"]
 
-        # Exactly the recorded winner object from the frozen response.
         winner_candidate = next(
             c
             for c in stored["response"]["candidates"]
@@ -791,78 +711,37 @@ def do_select(body):
 async def quantize(request: Request):
     try:
         body = await request.json()
-        logger.debug(f"Received request: {json.dumps(body, indent=2)}")
-    except Exception as e:
-        logger.error(f"Failed to parse JSON: {e}")
+    except Exception:
         return error_response("INVALID_INPUT", 400)
 
     if not isinstance(body, dict):
-        logger.error("Body is not a dict")
         return error_response("INVALID_INPUT", 400)
 
     phase = body.get("phase")
-    logger.info(f"Phase: {phase}")
 
-    # Unknown/missing phase.
     if phase not in {"freeze", "select"}:
-        logger.error(f"Unknown phase: {phase}")
         return error_response("INVALID_INPUT", 400)
 
-    # ---------------- FREEZE ----------------
     if phase == "freeze":
-        # IMPORTANT:
-        # Invalid freeze input must NOT reserve freezeId.
         if not validate_freeze_global(body):
-            logger.error("Freeze validation failed")
             return error_response("INVALID_INPUT", 400)
 
         return do_freeze(body)
 
-    # ---------------- SELECT ----------------
-    # Required top-level fields with empty array checks.
+    # SELECT phase
     candidates = body.get("candidates")
     rows = body.get("rows")
     policy = body.get("policy")
 
-    # Check for missing or empty arrays
-    if candidates is None:
-        logger.error("candidates is None")
-        return error_response("INVALID_INPUT", 400)
-    
-    if not isinstance(candidates, list):
-        logger.error(f"candidates is not a list: {type(candidates)}")
-        return error_response("INVALID_INPUT", 400)
-    
-    if len(candidates) == 0:
-        logger.error("candidates is empty")
-        return error_response("INVALID_INPUT", 400)
-    
-    if rows is None:
-        logger.error("rows is None")
-        return error_response("INVALID_INPUT", 400)
-    
-    if not isinstance(rows, list):
-        logger.error(f"rows is not a list: {type(rows)}")
-        return error_response("INVALID_INPUT", 400)
-    
-    if len(rows) == 0:
-        logger.error("rows is empty")
-        return error_response("INVALID_INPUT", 400)
-    
-    if policy is None:
-        logger.error("policy is None")
-        return error_response("INVALID_INPUT", 400)
-    
-    if not isinstance(policy, dict):
-        logger.error(f"policy is not a dict: {type(policy)}")
-        return error_response("INVALID_INPUT", 400)
-    
-    if "freezeId" not in body:
-        logger.error("freezeId missing")
-        return error_response("INVALID_INPUT", 400)
-    
-    if "latencies" not in body:
-        logger.error("latencies missing")
+    if (
+        not isinstance(candidates, list) 
+        or len(candidates) == 0
+        or not isinstance(rows, list) 
+        or len(rows) == 0
+        or not isinstance(policy, dict)
+        or "freezeId" not in body
+        or "latencies" not in body
+    ):
         return error_response("INVALID_INPUT", 400)
 
     return do_select(body)
