@@ -144,31 +144,37 @@ def validate_freeze_global(body):
             return False
         names.add(name)
 
+        # Check files - must be a dict (can be empty)
         files = c.get("files")
-        # Allow empty files, but validate it's a dict
-        if not isinstance(files, dict):
+        if files is None or not isinstance(files, dict):
             return False
         
-        # Only validate filenames if files has content
+        # Validate filenames if present
         for filename, text in files.items():
             if not nonempty_string(filename):
                 return False
             if not isinstance(text, str):
                 return False
 
-        if "loadable" not in c or not isinstance(c["loadable"], bool):
+        # loadable must be present and boolean
+        if "loadable" not in c:
+            return False
+        if not isinstance(c["loadable"], bool):
             return False
 
+        # calibrationDigest must be present and non-empty
         if "calibrationDigest" not in c:
             return False
         if not nonempty_string(c.get("calibrationDigest")):
             return False
 
+        # tokenizerDigest must be present and non-empty
         if "tokenizerDigest" not in c:
             return False
         if not nonempty_string(c.get("tokenizerDigest")):
             return False
 
+        # unsupportedReason is optional
         if "unsupportedReason" in c:
             reason = c.get("unsupportedReason")
             if reason is not None and not nonempty_string(reason):
@@ -197,8 +203,6 @@ def build_inventory(files):
 
 
 def freeze_candidate(candidate, request_cal, request_tok, allowed):
-    codes = []
-
     name = candidate["name"]
     files = candidate["files"]
     loadable = candidate["loadable"]
@@ -206,10 +210,10 @@ def freeze_candidate(candidate, request_cal, request_tok, allowed):
     cand_tok = candidate["tokenizerDigest"]
     reason = candidate.get("unsupportedReason")
 
-    # Build artifact inventory first.
+    # Build artifact inventory
     inventory, total_bytes, digest = build_inventory(files)
 
-    # If files is empty, mark as invalid with empty inventory
+    # If files is empty, return invalid immediately
     if len(files) == 0:
         return {
             "name": name,
@@ -220,7 +224,9 @@ def freeze_candidate(candidate, request_cal, request_tok, allowed):
             "reasonCodes": [],
         }
 
-    # An explicit unsupported reason which is allowed means unsupported.
+    codes = []
+
+    # Check unsupported reason
     if reason is not None and reason != "":
         if reason in allowed:
             return {
@@ -231,10 +237,8 @@ def freeze_candidate(candidate, request_cal, request_tok, allowed):
                 "packageDigest": digest,
                 "reasonCodes": [],
             }
-
         codes.append("UNALLOWED_UNSUPPORTED_REASON")
         codes = sorted_codes(codes)
-
         return {
             "name": name,
             "status": "invalid",
@@ -244,6 +248,7 @@ def freeze_candidate(candidate, request_cal, request_tok, allowed):
             "reasonCodes": codes,
         }
 
+    # Check loadable and digests
     if not loadable:
         codes.append("NOT_LOADABLE")
 
