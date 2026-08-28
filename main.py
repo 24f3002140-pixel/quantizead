@@ -97,10 +97,6 @@ def canonical_equal(a, b):
     return a == b
 
 
-# ------------------------------------------------------------
-# FREEZE
-# ------------------------------------------------------------
-
 def validate_freeze_global(body):
     if not isinstance(body, dict):
         return False
@@ -309,10 +305,6 @@ def do_freeze(body):
     return JSONResponse(status_code=200, content=response)
 
 
-# ------------------------------------------------------------
-# SELECT
-# ------------------------------------------------------------
-
 def validate_policy(policy):
     if not isinstance(policy, dict):
         return False
@@ -340,7 +332,6 @@ def validate_policy(policy):
 
     required_slices = policy["requiredSlices"]
 
-    # THIS IS THE FIX: requiredSlices MUST be a dict
     if not isinstance(required_slices, dict):
         return False
 
@@ -692,10 +683,6 @@ def do_select(body):
     )
 
 
-# ------------------------------------------------------------
-# ENDPOINT
-# ------------------------------------------------------------
-
 @app.post("/quantize")
 async def quantize(request: Request):
     try:
@@ -721,30 +708,15 @@ async def quantize(request: Request):
     rows = body.get("rows")
     policy = body.get("policy")
 
-    # Check each required field
-    if candidates is None:
-        return error_response("INVALID_INPUT", 400)
-    if not isinstance(candidates, list):
-        return error_response("INVALID_INPUT", 400)
-    if len(candidates) == 0:
-        return error_response("INVALID_INPUT", 400)
-    
-    if rows is None:
-        return error_response("INVALID_INPUT", 400)
-    if not isinstance(rows, list):
-        return error_response("INVALID_INPUT", 400)
-    if len(rows) == 0:
-        return error_response("INVALID_INPUT", 400)
-    
-    if policy is None:
-        return error_response("INVALID_INPUT", 400)
-    if not isinstance(policy, dict):
-        return error_response("INVALID_INPUT", 400)
-    
-    if "freezeId" not in body:
-        return error_response("INVALID_INPUT", 400)
-    
-    if "latencies" not in body:
+    if (
+        not isinstance(candidates, list) 
+        or len(candidates) == 0
+        or not isinstance(rows, list) 
+        or len(rows) == 0
+        or not isinstance(policy, dict)
+        or "freezeId" not in body
+        or "latencies" not in body
+    ):
         return error_response("INVALID_INPUT", 400)
 
     return do_select(body)
