@@ -403,21 +403,26 @@ def evaluate_candidate(candidate, rows, required_slices):
 def do_select(body):
     freeze_id = body.get("freezeId")
     if not isinstance(freeze_id, str) or not freeze_id:
+        logger.error("freezeId missing or empty")
         return error_response("INVALID_INPUT", 400)
 
     stored = FREEZES.get(freeze_id)
     if stored is None:
+        logger.error(f"freezeId {freeze_id} not found")
         return error_response("NOT_FROZEN", 400)
 
     submitted_candidates = body.get("candidates")
     if not isinstance(submitted_candidates, list) or len(submitted_candidates) == 0:
+        logger.error("candidates is empty or not a list")
         return error_response("INVALID_INPUT", 400)
 
     if not get_lineage_info(stored["response"]["candidates"], submitted_candidates):
+        logger.error("Lineage mismatch")
         return error_response("INVALID_LINEAGE", 400)
 
     policy = body.get("policy")
     if not validate_policy(policy):
+        logger.error("Policy validation failed")
         return error_response("INVALID_POLICY", 400)
 
     candidate_order = policy["candidateOrder"]
@@ -429,14 +434,17 @@ def do_select(body):
         len(submitted_names) != len(set(submitted_names)) or
         set(stored_names) != set(submitted_names) or
         set(stored_names) != set(candidate_order)):
+        logger.error(f"Name mismatch: stored={stored_names}, submitted={submitted_names}, order={candidate_order}")
         return error_response("INVALID_POLICY", 400)
 
     latencies = body.get("latencies")
     if not isinstance(latencies, dict):
+        logger.error("latencies is not a dict")
         return error_response("INVALID_POLICY", 400)
 
     rows = body.get("rows")
     if not isinstance(rows, list) or len(rows) == 0:
+        logger.error("rows is empty or not a list")
         return error_response("INVALID_INPUT", 400)
 
     results = []
