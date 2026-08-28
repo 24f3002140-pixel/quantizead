@@ -1,7 +1,7 @@
 {
-  "name": "quantizead",
+  "name": "quantize-admission-api",
   "version": "1.0.0",
-  "description": "Quantize and admit model API",
+  "private": true,
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
