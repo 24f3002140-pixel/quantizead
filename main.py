@@ -206,7 +206,7 @@ def freeze_candidate(candidate, request_cal, request_tok, allowed):
     # Build inventory
     inventory, total_bytes, digest = build_inventory(files)
 
-    # Case 1: Empty files -> invalid with empty inventory
+    # Empty files -> invalid
     if len(files) == 0:
         return {
             "name": name,
@@ -219,7 +219,7 @@ def freeze_candidate(candidate, request_cal, request_tok, allowed):
 
     codes = []
 
-    # Case 2: Has unsupportedReason
+    # Has unsupportedReason
     if reason is not None and reason != "":
         if reason in allowed:
             return {
@@ -241,7 +241,7 @@ def freeze_candidate(candidate, request_cal, request_tok, allowed):
             "reasonCodes": codes,
         }
 
-    # Case 3: Normal validation
+    # Normal validation
     if not loadable:
         codes.append("NOT_LOADABLE")
 
@@ -346,6 +346,7 @@ def validate_policy(policy):
 
     required_slices = policy["requiredSlices"]
 
+    # requiredSlices must be a dict with string keys and number values
     if not isinstance(required_slices, dict):
         return False
 
