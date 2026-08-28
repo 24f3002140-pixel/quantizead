@@ -1,19 +1,33 @@
+"use strict";
+
 const http = require("http");
 const crypto = require("crypto");
 
 const PORT = Number(process.env.PORT) || 10000;
-const freezes = new Map();
+
+/*
+ * Stateful storage.
+ * freezeId -> {
+ *   request: original freeze request,
+ *   response: exact frozen response
+ * }
+ */
+const freezeStore = new Map();
 
 /* ============================================================
-   BASIC HELPERS
+   HELPERS
 ============================================================ */
 
-function isObject(v) {
-  return v !== null && typeof v === "object" && !Array.isArray(v);
+function isObject(value) {
+  return (
+    value !== null &&
+    typeof value === "object" &&
+    !Array.isArray(value)
+  );
 }
 
-function nonEmptyString(v) {
-  return typeof v === "string" && v.length > 0;
+function nonEmptyString(value) {
+  return typeof value === "string" && value.length > 0;
 }
 
 function utf8Compare(a, b) {
@@ -23,88 +37,73 @@ function utf8Compare(a, b) {
   );
 }
 
-function uniqueStrings(v) {
-  if (!Array.isArray(v)) return false;
-
-  const seen = new Set();
-
-  for (const x of v) {
-    if (!nonEmptyString(x) || seen.has(x)) {
-      return false;
-    }
-    seen.add(x);
-  }
-
-  return true;
-}
-
-function safeNonNegativeInteger(v) {
-  return (
-    typeof v === "number" &&
-    Number.isSafeInteger(v) &&
-    v >= 0
-  );
-}
-
-function finiteNonNegative(v) {
-  return (
-    typeof v === "number" &&
-    Number.isFinite(v) &&
-    v >= 0
-  );
-}
-
-function validFloor(v) {
-  return (
-    typeof v === "number" &&
-    Number.isFinite(v) &&
-    v >= 0 &&
-    v <= 1
-  );
-}
-
-function binaryPrediction(v) {
-  return (
-    typeof v === "number" &&
-    Number.isInteger(v) &&
-    (v === 0 || v === 1)
-  );
-}
-
-function sha256(data) {
+function sha256(value) {
   return crypto
     .createHash("sha256")
-    .update(data)
+    .update(value)
     .digest("hex");
 }
 
-function round12(v) {
-  const x = Number(v.toFixed(12));
-  return Object.is(x, -0) ? 0 : x;
+function round12(value) {
+  return Number(value.toFixed(12));
 }
 
-function sortCodes(codes) {
+function sortedUniqueCodes(codes) {
   return [...new Set(codes)].sort(utf8Compare);
 }
 
+function safeNonNegativeInteger(value) {
+  return (
+    typeof value === "number" &&
+    Number.isSafeInteger(value) &&
+    value >= 0
+  );
+}
+
+function finiteNonNegative(value) {
+  return (
+    typeof value === "number" &&
+    Number.isFinite(value) &&
+    value >= 0
+  );
+}
+
+function validFloor(value) {
+  return (
+    typeof value === "number" &&
+    Number.isFinite(value) &&
+    value >= 0 &&
+    value <= 1
+  );
+}
+
+function binaryValue(value) {
+  return (
+    typeof value === "number" &&
+    Number.isInteger(value) &&
+    (value === 0 || value === 1)
+  );
+}
+
 /*
- * Canonical comparison used for replay detection.
- * It preserves array ordering but sorts object keys by UTF-8.
+ * Canonical representation used ONLY for comparing
+ * request objects for freezeId replay/conflict.
  */
-function canonicalize(value) {
+function canonical(value) {
   if (Array.isArray(value)) {
-    return value.map(canonicalize);
+    return value.map(canonical);
   }
 
   if (isObject(value)) {
-    const out = {};
-    const keys = Object.keys(value).sort(utf8Compare);
+    const result = {};
 
-    for (const key of keys) {
-      out[key] = canonicalize(value[key]);
+    for (
+      const key of Object.keys(value).sort(utf8Compare)
+    ) {
+      result[key] = canonical(value[key]);
     }
 
-    return out;
+    return result;
   }
 
   return value;
@@ -112,26 +111,16 @@ function canonicalize(value) {
 
 function deepEqual(a, b) {
   return (
-    JSON.stringify(canonicalize(a)) ===
-    JSON.stringify(canonicalize(b))
+    JSON.stringify(canonical(a)) ===
+    JSON.stringify(canonical(b))
   );
 }
 
 /* ============================================================
-   MANIFEST
+   MANIFEST CONSTRUCTION
 ============================================================ */
 
-/*
- * Files are JSON object properties whose values are UTF-8 text.
- *
- * Inventory:
- *   name
- *   bytes
- *   sha256
- *
- * Inventory is sorted by UTF-8 filename.
- */
-function buildManifest(files) {
+function createManifest(files) {
   if (!isObject(files)) {
     return null;
   }
@@ -143,10 +132,17 @@ function buildManifest(files) {
   }
 
   for (const name of names) {
+    /*
+     * File names must be non-empty strings.
+     */
     if (!nonEmptyString(name)) {
       return null;
     }
 
+    /*
+     * File text is DATA.
+     * It must be a string and must never be interpreted.
+     */
     if (typeof files[name] !== "string") {
       return null;
     }
@@ -177,9 +173,10 @@ function buildManifest(files) {
   }
 
   /*
-   * JSON.stringify produces compact JSON.
-   * Object insertion order is exactly:
-   * name, bytes, sha256.
+   * Inventory object key order MUST be:
+   * name, bytes, sha256
+   *
+   * JSON.stringify is compact by default.
    */
   const packageDigest = sha256(
     Buffer.from(
@@ -195,11 +192,11 @@ function buildManifest(files) {
   };
 }
 
-/*
- * Recompute a stored/submitted inventory.
- * Never trust submitted totalBytes/packageDigest.
- */
-function validateManifest(candidate) {
+/* ============================================================
+   MANIFEST VALIDATION DURING SELECT
+============================================================ */
+
+function validateRecordedManifest(candidate) {
   if (!isObject(candidate)) {
     return null;
   }
@@ -209,7 +206,7 @@ function validateManifest(candidate) {
   }
 
   const inventory = [];
-  const seen = new Set();
+  const names = new Set();
 
   for (const item of candidate.inventory) {
     if (!isObject(item)) {
@@ -220,11 +217,11 @@ function validateManifest(candidate) {
       return null;
     }
 
-    if (seen.has(item.name)) {
+    if (names.has(item.name)) {
       return null;
     }
 
-    seen.add(item.name);
+    names.add(item.name);
 
     if (!safeNonNegativeInteger(item.bytes)) {
       return null;
@@ -245,13 +242,13 @@ function validateManifest(candidate) {
   }
 
   /*
-   * Inventory MUST already be sorted by UTF-8 filename.
+   * Inventory must already be UTF-8 sorted.
    */
-  const sorted = [...inventory].sort(
+  const sortedInventory = [...inventory].sort(
     (a, b) => utf8Compare(a.name, b.name)
   );
 
-  if (!deepEqual(inventory, sorted)) {
+  if (!deepEqual(inventory, sortedInventory)) {
     return null;
   }
 
@@ -265,6 +262,10 @@ function validateManifest(candidate) {
     }
   }
 
+  /*
+   * NEVER trust submitted totalBytes.
+   * Compare it against recomputed value.
+   */
   if (candidate.totalBytes !== totalBytes) {
     return null;
   }
@@ -276,6 +277,9 @@ function validateManifest(candidate) {
     )
   );
 
+  /*
+   * NEVER trust submitted packageDigest.
+   */
   if (candidate.packageDigest !== packageDigest) {
     return null;
   }
@@ -288,10 +292,10 @@ function validateManifest(candidate) {
 }
 
 /* ============================================================
-   FREEZE VALIDATION
+   FREEZE INPUT VALIDATION
 ============================================================ */
 
-function validFreezeEnvelope(body) {
+function validFreezeInput(body) {
   if (!isObject(body)) {
     return false;
   }
@@ -305,7 +309,7 @@ function validFreezeEnvelope(body) {
   }
 
   /*
-   * SPEC SAYS CHARACTERS, NOT UTF-8 BYTES.
+   * Maximum 128 JS characters.
    */
   if (body.freezeId.length > 128) {
     return false;
@@ -319,8 +323,22 @@ function validFreezeEnvelope(body) {
     return false;
   }
 
-  if (!uniqueStrings(body.allowedUnsupportedReasons)) {
+  if (!Array.isArray(body.allowedUnsupportedReasons)) {
     return false;
+  }
+
+  const allowed = new Set();
+
+  for (const reason of body.allowedUnsupportedReasons) {
+    if (!nonEmptyString(reason)) {
+      return false;
+    }
+
+    if (allowed.has(reason)) {
+      return false;
+    }
+
+    allowed.add(reason);
   }
 
   if (
@@ -330,30 +348,25 @@ function validFreezeEnvelope(body) {
     return false;
   }
 
-  return true;
-}
+  /*
+   * Candidate names must be non-empty and unique.
+   */
+  const names = new Set();
 
-/*
- * Candidate names are part of request structure.
- * Everything else can be represented as an invalid candidate.
- */
-function validCandidateNames(candidates) {
-  const seen = new Set();
-
-  for (const c of candidates) {
-    if (!isObject(c)) {
+  for (const candidate of body.candidates) {
+    if (!isObject(candidate)) {
       return false;
     }
 
-    if (!nonEmptyString(c.name)) {
+    if (!nonEmptyString(candidate.name)) {
       return false;
     }
 
-    if (seen.has(c.name)) {
+    if (names.has(candidate.name)) {
       return false;
     }
 
-    seen.add(c.name);
+    names.add(candidate.name);
   }
 
   return true;
@@ -363,11 +376,11 @@ function validCandidateNames(candidates) {
    FREEZE
 ============================================================ */
 
-function doFreeze(body) {
+function handleFreeze(body) {
   /*
-   * Only envelope-level malformed freeze requests are 400.
+   * Only explicitly malformed freeze envelopes get HTTP 400.
    */
-  if (!validFreezeEnvelope(body)) {
+  if (!validFreezeInput(body)) {
     return {
       status: 400,
       body: {
@@ -377,27 +390,18 @@ function doFreeze(body) {
   }
 
   /*
-   * Candidate names must be unique.
+   * Existing freezeId:
+   *
+   * identical input -> exact replay
+   * different input -> 409
    */
-  if (!validCandidateNames(body.candidates)) {
-    return {
-      status: 400,
-      body: {
-        error: "INVALID_INPUT"
-      }
-    };
-  }
+  if (freezeStore.has(body.freezeId)) {
+    const saved = freezeStore.get(body.freezeId);
 
-  /*
-   * Check replay/conflict BEFORE doing any persistent write.
-   */
-  const existing = freezes.get(body.freezeId);
-
-  if (existing) {
-    if (deepEqual(existing.request, body)) {
+    if (deepEqual(saved.request, body)) {
       return {
         status: 200,
-        body: existing.response
+        body: saved.response
       };
     }
 
@@ -409,32 +413,90 @@ function doFreeze(body) {
     };
   }
 
-  const results = [];
+  const outputCandidates = [];
 
-  for (const c of body.candidates) {
-    const codes = [];
-
+  for (const candidate of body.candidates) {
     /*
      * --------------------------------------------------------
      * Files
      * --------------------------------------------------------
-     *
-     * Invalid files do NOT reject the whole freeze request.
-     * They produce:
-     *   inventory: []
-     *   totalBytes: null
-     *   packageDigest: null
      */
-    const manifest = buildManifest(c.files);
+    const manifest = createManifest(
+      candidate.files
+    );
 
-    if (!manifest) {
-      results.push({
-        name: c.name,
+    /*
+     * Invalid file object means invalid candidate.
+     * It does NOT reject the entire freeze request.
+     */
+    if (manifest === null) {
+      outputCandidates.push({
+        name: candidate.name,
         status: "invalid",
         inventory: [],
         totalBytes: null,
         packageDigest: null,
-        reasonCodes: ["INVALID_INPUT"]
+        reasonCodes: [
+          "INVALID_INPUT"
+        ]
+      });
+
+      continue;
+    }
+
+    const candidateCodes = [];
+
+    /*
+     * Candidate field validation.
+     */
+    if (
+      candidate.loadable !== true &&
+      candidate.loadable !== false
+    ) {
+      candidateCodes.push(
+        "INVALID_INPUT"
+      );
+    }
+
+    if (
+      !nonEmptyString(
+        candidate.calibrationDigest
+      )
+    ) {
+      candidateCodes.push(
+        "INVALID_INPUT"
+      );
+    }
+
+    if (
+      !nonEmptyString(
+        candidate.tokenizerDigest
+      )
+    ) {
+      candidateCodes.push(
+        "INVALID_INPUT"
+      );
+    }
+
+    if (
+      candidate.unsupportedReason !== undefined &&
+      candidate.unsupportedReason !== null &&
+      typeof candidate.unsupportedReason !== "string"
+    ) {
+      candidateCodes.push(
+        "INVALID_INPUT"
+      );
+    }
+
+    if (candidateCodes.length > 0) {
+      outputCandidates.push({
+        name: candidate.name,
+        status: "invalid",
+        inventory: [],
+        totalBytes: null,
+        packageDigest: null,
+        reasonCodes:
+          sortedUniqueCodes(candidateCodes)
       });
 
       continue;
@@ -442,68 +504,22 @@ function doFreeze(body) {
 
     /*
      * --------------------------------------------------------
-     * Candidate fields
+     * UNSUPPORTED REASON
      * --------------------------------------------------------
      */
+    const hasUnsupportedReason =
+      typeof candidate.unsupportedReason === "string" &&
+      candidate.unsupportedReason.length > 0;
 
-    if (
-      c.loadable !== true &&
-      c.loadable !== false
-    ) {
-      codes.push("INVALID_INPUT");
-    }
-
-    if (!nonEmptyString(c.calibrationDigest)) {
-      codes.push("INVALID_INPUT");
-    }
-
-    if (!nonEmptyString(c.tokenizerDigest)) {
-      codes.push("INVALID_INPUT");
-    }
-
-    if (
-      c.unsupportedReason !== undefined &&
-      c.unsupportedReason !== null &&
-      typeof c.unsupportedReason !== "string"
-    ) {
-      codes.push("INVALID_INPUT");
-    }
-
-    if (codes.length > 0) {
-      results.push({
-        name: c.name,
-        status: "invalid",
-        inventory: [],
-        totalBytes: null,
-        packageDigest: null,
-        reasonCodes: sortCodes(codes)
-      });
-
-      continue;
-    }
-
-    /*
-     * --------------------------------------------------------
-     * unsupportedReason
-     * --------------------------------------------------------
-     */
-
-    const hasReason =
-      typeof c.unsupportedReason === "string" &&
-      c.unsupportedReason.length > 0;
-
-    if (hasReason) {
+    if (hasUnsupportedReason) {
       const allowed =
         body.allowedUnsupportedReasons.includes(
-          c.unsupportedReason
+          candidate.unsupportedReason
         );
 
-      /*
-       * Reason exists but isn't allowed => invalid.
-       */
       if (!allowed) {
-        results.push({
-          name: c.name,
+        outputCandidates.push({
+          name: candidate.name,
           status: "invalid",
           inventory: [],
           totalBytes: null,
@@ -517,12 +533,11 @@ function doFreeze(body) {
       }
 
       /*
-       * Allowed unsupported reason => unsupported.
-       *
-       * The artifact is still frozen with its real manifest.
+       * Allowed reason means unsupported.
+       * Keep its valid manifest.
        */
-      results.push({
-        name: c.name,
+      outputCandidates.push({
+        name: candidate.name,
         status: "unsupported",
         inventory: manifest.inventory,
         totalBytes: manifest.totalBytes,
@@ -535,43 +550,49 @@ function doFreeze(body) {
 
     /*
      * --------------------------------------------------------
-     * Normal frozen candidate
+     * NORMAL FROZEN CANDIDATE
      * --------------------------------------------------------
      */
-
-    if (c.loadable !== true) {
-      codes.push("NOT_LOADABLE");
+    if (candidate.loadable !== true) {
+      candidateCodes.push(
+        "NOT_LOADABLE"
+      );
     }
 
     if (
-      c.calibrationDigest !==
+      candidate.calibrationDigest !==
       body.calibrationDigest
     ) {
-      codes.push("CALIBRATION_MISMATCH");
+      candidateCodes.push(
+        "CALIBRATION_MISMATCH"
+      );
     }
 
     if (
-      c.tokenizerDigest !==
+      candidate.tokenizerDigest !==
       body.tokenizerDigest
     ) {
-      codes.push("TOKENIZER_MISMATCH");
+      candidateCodes.push(
+        "TOKENIZER_MISMATCH"
+      );
     }
 
-    if (codes.length > 0) {
-      results.push({
-        name: c.name,
+    if (candidateCodes.length > 0) {
+      outputCandidates.push({
+        name: candidate.name,
         status: "invalid",
         inventory: [],
         totalBytes: null,
         packageDigest: null,
-        reasonCodes: sortCodes(codes)
+        reasonCodes:
+          sortedUniqueCodes(candidateCodes)
       });
 
       continue;
     }
 
-    results.push({
-      name: c.name,
+    outputCandidates.push({
+      name: candidate.name,
       status: "frozen",
       inventory: manifest.inventory,
       totalBytes: manifest.totalBytes,
@@ -583,22 +604,29 @@ function doFreeze(body) {
   /*
    * Candidate response sorted by UTF-8 name.
    */
-  results.sort(
+  outputCandidates.sort(
     (a, b) => utf8Compare(a.name, b.name)
   );
 
   const response = {
     freezeId: body.freezeId,
-    candidates: results
+    candidates: outputCandidates
   };
 
   /*
-   * Persist complete response.
+   * Persist the COMPLETE response and original request.
    */
-  freezes.set(body.freezeId, {
-    request: JSON.parse(JSON.stringify(body)),
-    response: JSON.parse(JSON.stringify(response))
-  });
+  freezeStore.set(
+    body.freezeId,
+    {
+      request: JSON.parse(
+        JSON.stringify(body)
+      ),
+      response: JSON.parse(
+        JSON.stringify(response)
+      )
+    }
+  );
 
   return {
     status: 200,
@@ -607,21 +635,27 @@ function doFreeze(body) {
 }
 
 /* ============================================================
-   POLICY
+   POLICY VALIDATION
 ============================================================ */
 
-function validPolicy(policy) {
+function validatePolicy(policy) {
   if (!isObject(policy)) {
     return false;
   }
 
   if (
-    !safeNonNegativeInteger(policy.maxBytes)
+    !safeNonNegativeInteger(
+      policy.maxBytes
+    )
   ) {
     return false;
   }
 
-  if (!validFloor(policy.aggregateFloor)) {
+  if (
+    !validFloor(
+      policy.aggregateFloor
+    )
+  ) {
     return false;
   }
 
@@ -629,25 +663,18 @@ function validPolicy(policy) {
     return false;
   }
 
-  const sliceNames =
-    Object.keys(policy.requiredSlices);
-
-  const sliceSet = new Set();
-
-  for (const name of sliceNames) {
-    if (!nonEmptyString(name)) {
+  for (
+    const sliceName of Object.keys(
+      policy.requiredSlices
+    )
+  ) {
+    if (!nonEmptyString(sliceName)) {
       return false;
     }
-
-    if (sliceSet.has(name)) {
-      return false;
-    }
-
-    sliceSet.add(name);
 
     if (
       !validFloor(
-        policy.requiredSlices[name]
+        policy.requiredSlices[sliceName]
       )
     ) {
       return false;
@@ -655,31 +682,43 @@ function validPolicy(policy) {
   }
 
   if (
-    !finiteNonNegative(policy.maxLatencyMs)
+    !finiteNonNegative(
+      policy.maxLatencyMs
+    )
   ) {
     return false;
   }
 
   if (
-    !uniqueStrings(policy.candidateOrder)
+    !Array.isArray(
+      policy.candidateOrder
+    )
   ) {
     return false;
+  }
+
+  const names = new Set();
+
+  for (const name of policy.candidateOrder) {
+    if (!nonEmptyString(name)) {
+      return false;
+    }
+
+    if (names.has(name)) {
+      return false;
+    }
+
+    names.add(name);
   }
 
   return true;
 }
 
 /* ============================================================
-   SELECT ENVELOPE
+   SELECT INPUT VALIDATION
 ============================================================ */
 
 function validSelectEnvelope(body) {
-  /*
-   * Assignment explicitly says:
-   *
-   * select request without array candidates and rows
-   * plus object policy => 400
-   */
   if (!isObject(body)) {
     return false;
   }
@@ -692,6 +731,9 @@ function validSelectEnvelope(body) {
     return false;
   }
 
+  /*
+   * These three are explicitly required by the assignment.
+   */
   if (!Array.isArray(body.candidates)) {
     return false;
   }
@@ -711,7 +753,7 @@ function validSelectEnvelope(body) {
    ROW VALIDATION
 ============================================================ */
 
-function rowsStructurallyValid(rows) {
+function validRows(rows) {
   if (!Array.isArray(rows)) {
     return false;
   }
@@ -730,7 +772,7 @@ function rowsStructurallyValid(rows) {
       return false;
     }
 
-    if (!binaryPrediction(row.label)) {
+    if (!binaryValue(row.label)) {
       return false;
     }
 
@@ -747,38 +789,31 @@ function rowsStructurallyValid(rows) {
 }
 
 /* ============================================================
-   CANDIDATE ORDER
+   SET COMPARISON
 ============================================================ */
 
-function sameCandidateSet(aNames, bNames) {
-  if (
-    !Array.isArray(aNames) ||
-    !Array.isArray(bNames)
-  ) {
+function sameUniqueSet(a, b) {
+  if (!Array.isArray(a) || !Array.isArray(b)) {
     return false;
   }
 
-  if (aNames.length !== bNames.length) {
+  const sa = new Set(a);
+  const sb = new Set(b);
+
+  if (sa.size !== a.length) {
     return false;
   }
 
-  const a = new Set(aNames);
-  const b = new Set(bNames);
-
-  if (a.size !== aNames.length) {
+  if (sb.size !== b.length) {
     return false;
   }
 
-  if (b.size !== bNames.length) {
+  if (sa.size !== sb.size) {
     return false;
   }
 
-  if (a.size !== b.size) {
-    return false;
-  }
-
-  for (const name of a) {
-    if (!b.has(name)) {
+  for (const value of sa) {
+    if (!sb.has(value)) {
       return false;
     }
   }
@@ -787,7 +822,7 @@ function sameCandidateSet(aNames, bNames) {
 }
 
 /* ============================================================
-   METRICS
+   PREDICTION METRICS
 ============================================================ */
 
 function calculateMetrics(
@@ -795,17 +830,17 @@ function calculateMetrics(
   rows,
   requiredSlices
 ) {
-  let predictionsValid = true;
-
   /*
-   * Empty rows means no aggregate can be computed.
+   * No rows means there is no measurable accuracy.
    */
   if (rows.length === 0) {
     const slices = {};
 
-    for (const sliceName of Object.keys(
-      requiredSlices
-    )) {
+    for (
+      const sliceName of Object.keys(
+        requiredSlices
+      )
+    ) {
       slices[sliceName] = null;
     }
 
@@ -819,7 +854,7 @@ function calculateMetrics(
   let correct = 0;
 
   /*
-   * Validate EVERY row first.
+   * Validate every candidate prediction for every row.
    */
   for (const row of rows) {
     if (
@@ -828,16 +863,30 @@ function calculateMetrics(
         candidateName
       )
     ) {
-      predictionsValid = false;
-      break;
+      return {
+        valid: false,
+        aggregate: null,
+        slices: Object.fromEntries(
+          Object.keys(
+            requiredSlices
+          ).map(name => [name, null])
+        )
+      };
     }
 
     const prediction =
       row.predictions[candidateName];
 
-    if (!binaryPrediction(prediction)) {
-      predictionsValid = false;
-      break;
+    if (!binaryValue(prediction)) {
+      return {
+        valid: false,
+        aggregate: null,
+        slices: Object.fromEntries(
+          Object.keys(
+            requiredSlices
+          ).map(name => [name, null])
+        )
+      };
     }
 
     if (prediction === row.label) {
@@ -845,50 +894,48 @@ function calculateMetrics(
     }
   }
 
+  const aggregate =
+    round12(
+      correct / rows.length
+    );
+
   const slices = {};
 
-  if (!predictionsValid) {
-    for (const sliceName of Object.keys(
+  for (
+    const sliceName of Object.keys(
       requiredSlices
-    )) {
-      slices[sliceName] = null;
-    }
-
-    return {
-      valid: false,
-      aggregate: null,
-      slices
-    };
-  }
-
-  const aggregate =
-    round12(correct / rows.length);
-
-  /*
-   * Required slices.
-   */
-  for (const sliceName of Object.keys(
-    requiredSlices
-  )) {
-    const sliceRows =
+    )
+  ) {
+    const matchingRows =
       rows.filter(
-        row => row.slice === sliceName
+        row =>
+          row.slice === sliceName
       );
 
-    if (sliceRows.length === 0) {
+    /*
+     * Required slice missing.
+     */
+    if (matchingRows.length === 0) {
       slices[sliceName] = null;
       continue;
     }
 
     let sliceCorrect = 0;
 
-    for (const row of sliceRows) {
+    for (const row of matchingRows) {
       const prediction =
         row.predictions[candidateName];
 
-      if (!binaryPrediction(prediction)) {
-        predictionsValid = false;
-        break;
+      if (!binaryValue(prediction)) {
+        return {
+          valid: false,
+          aggregate: null,
+          slices: Object.fromEntries(
+            Object.keys(
+              requiredSlices
+            ).map(name => [name, null])
+          )
+        };
       }
 
       if (prediction === row.label) {
@@ -896,28 +943,11 @@ function calculateMetrics(
       }
     }
 
-    if (!predictionsValid) {
-      break;
-    }
-
     slices[sliceName] =
       round12(
-        sliceCorrect / sliceRows.length
+        sliceCorrect /
+        matchingRows.length
       );
-  }
-
-  if (!predictionsValid) {
-    for (const sliceName of Object.keys(
-      requiredSlices
-    )) {
-      slices[sliceName] = null;
-    }
-
-    return {
-      valid: false,
-      aggregate: null,
-      slices
-    };
   }
 
   return {
@@ -928,12 +958,62 @@ function calculateMetrics(
 }
 
 /* ============================================================
+   RESULT ORDER
+============================================================ */
+
+function resultComparator(candidateOrder) {
+  const position = new Map();
+
+  candidateOrder.forEach(
+    (name, index) => {
+      position.set(name, index);
+    }
+  );
+
+  return (a, b) => {
+    const ai = position.has(a.name)
+      ? position.get(a.name)
+      : null;
+
+    const bi = position.has(b.name)
+      ? position.get(b.name)
+      : null;
+
+    /*
+     * Candidate order first.
+     */
+    if (
+      ai !== null &&
+      bi !== null
+    ) {
+      return ai - bi;
+    }
+
+    if (ai !== null) {
+      return -1;
+    }
+
+    if (bi !== null) {
+      return 1;
+    }
+
+    /*
+     * UTF-8 fallback.
+     */
+    return utf8Compare(
+      a.name,
+      b.name
+    );
+  };
+}
+
+/* ============================================================
    SELECT
 ============================================================ */
 
-function doSelect(body) {
+function handleSelect(body) {
   /*
-   * Only the explicit malformed select envelope is 400.
+   * Explicit malformed select request.
    */
   if (!validSelectEnvelope(body)) {
     return {
@@ -945,13 +1025,12 @@ function doSelect(body) {
   }
 
   /*
-   * Candidate objects must at least expose names so that
-   * the request can be processed.
+   * Candidate names must be usable.
    */
-  for (const c of body.candidates) {
+  for (const candidate of body.candidates) {
     if (
-      !isObject(c) ||
-      !nonEmptyString(c.name)
+      !isObject(candidate) ||
+      !nonEmptyString(candidate.name)
     ) {
       return {
         status: 400,
@@ -963,16 +1042,12 @@ function doSelect(body) {
   }
 
   /*
-   * Unknown freeze ID.
-   *
-   * This is NOT a malformed request.
-   * Return a normal selection response.
+   * ----------------------------------------------------------
+   * NOT FROZEN
+   * ----------------------------------------------------------
    */
-  const stored =
-    freezes.get(body.freezeId);
-
-  if (!stored) {
-    const order =
+  if (!freezeStore.has(body.freezeId)) {
+    const candidateOrder =
       Array.isArray(
         body.policy.candidateOrder
       )
@@ -980,18 +1055,22 @@ function doSelect(body) {
         : [];
 
     const results =
-      body.candidates.map(c => ({
-        name: c.name,
-        aggregate: null,
-        slices: {},
-        totalBytes: null,
-        latencyMs: null,
-        admitted: false,
-        reasonCodes: ["NOT_FROZEN"]
-      }));
+      body.candidates.map(
+        candidate => ({
+          name: candidate.name,
+          aggregate: null,
+          slices: {},
+          totalBytes: null,
+          latencyMs: null,
+          admitted: false,
+          reasonCodes: [
+            "NOT_FROZEN"
+          ]
+        })
+      );
 
     results.sort(
-      makeResultComparator(order)
+      resultComparator(candidateOrder)
     );
 
     return {
@@ -1005,24 +1084,27 @@ function doSelect(body) {
     };
   }
 
+  const stored =
+    freezeStore.get(body.freezeId);
+
   const storedCandidates =
     stored.response.candidates;
 
   const storedNames =
     storedCandidates.map(
-      c => c.name
+      candidate => candidate.name
     );
 
   const submittedNames =
     body.candidates.map(
-      c => c.name
+      candidate => candidate.name
     );
 
   /*
-   * The supplied candidate array must exactly equal the
-   * stored response.
+   * The complete submitted candidate array must exactly
+   * equal the stored response candidate array.
    */
-  const lineageValid =
+  const lineageExact =
     deepEqual(
       body.candidates,
       storedCandidates
@@ -1032,31 +1114,30 @@ function doSelect(body) {
    * Policy validation.
    */
   const policyValid =
-    validPolicy(body.policy);
+    validatePolicy(body.policy);
 
   /*
-   * Candidate order must be the same unique set.
+   * Candidate order must contain exactly the same
+   * unique candidate-name set.
    */
-  const candidateSetValid =
+  const candidateOrderValid =
     policyValid &&
-    sameCandidateSet(
+    sameUniqueSet(
       storedNames,
       body.policy.candidateOrder
     );
 
   /*
-   * Latencies must be an object.
+   * Latencies must be object-shaped.
    */
-  const latenciesValid =
+  const latencyObject =
     isObject(body.latencies);
 
   /*
-   * Rows structural validation.
+   * Rows must be structurally valid.
    */
-  const rowsValid =
-    rowsStructurallyValid(
-      body.rows
-    );
+  const rowsAreValid =
+    validRows(body.rows);
 
   const results = [];
 
@@ -1065,17 +1146,26 @@ function doSelect(body) {
 
     /*
      * --------------------------------------------------------
-     * LINEAGE
+     * FROZEN STATUS
      * --------------------------------------------------------
+     *
+     * IMPORTANT:
+     *
+     * unsupported / invalid candidate
+     * -> NOT_FROZEN
+     *
+     * submitted candidate array differs
+     * -> INVALID_LINEAGE
      */
-    if (
-      !lineageValid ||
-      candidate.status !== "frozen"
-    ) {
+    if (!lineageExact) {
       codes.push(
-        candidate.status === "frozen"
-          ? "INVALID_LINEAGE"
-          : "INVALID_LINEAGE"
+        "INVALID_LINEAGE"
+      );
+    }
+
+    if (candidate.status !== "frozen") {
+      codes.push(
+        "NOT_FROZEN"
       );
     }
 
@@ -1085,11 +1175,13 @@ function doSelect(body) {
      * --------------------------------------------------------
      */
     const manifest =
-      validateManifest(candidate);
+      validateRecordedManifest(
+        candidate
+      );
 
     let totalBytes = null;
 
-    if (!manifest) {
+    if (manifest === null) {
       codes.push(
         "INVALID_MANIFEST"
       );
@@ -1100,20 +1192,36 @@ function doSelect(body) {
 
     /*
      * --------------------------------------------------------
+     * POLICY
+     * --------------------------------------------------------
+     */
+    if (!policyValid) {
+      codes.push(
+        "INVALID_POLICY"
+      );
+    } else if (!candidateOrderValid) {
+      codes.push(
+        "INVALID_POLICY"
+      );
+    }
+
+    /*
+     * --------------------------------------------------------
      * PREDICTIONS
      * --------------------------------------------------------
      */
     let aggregate = null;
     let slices = {};
 
-    if (rowsValid) {
+    if (
+      rowsAreValid &&
+      policyValid
+    ) {
       const metrics =
         calculateMetrics(
           candidate.name,
           body.rows,
-          policyValid
-            ? body.policy.requiredSlices
-            : {}
+          body.policy.requiredSlices
         );
 
       aggregate =
@@ -1133,9 +1241,11 @@ function doSelect(body) {
       );
 
       if (policyValid) {
-        for (const sliceName of Object.keys(
-          body.policy.requiredSlices
-        )) {
+        for (
+          const sliceName of Object.keys(
+            body.policy.requiredSlices
+          )
+        ) {
           slices[sliceName] = null;
         }
       }
@@ -1143,32 +1253,12 @@ function doSelect(body) {
 
     /*
      * --------------------------------------------------------
-     * POLICY
-     * --------------------------------------------------------
-     */
-    if (!policyValid) {
-      codes.push(
-        "INVALID_POLICY"
-      );
-    }
-
-    if (
-      policyValid &&
-      !candidateSetValid
-    ) {
-      codes.push(
-        "INVALID_POLICY"
-      );
-    }
-
-    /*
-     * --------------------------------------------------------
-     * ACCURACY
+     * ACCURACY FLOORS
      * --------------------------------------------------------
      */
     if (
       policyValid &&
-      rowsValid &&
+      rowsAreValid &&
       aggregate !== null
     ) {
       if (
@@ -1180,18 +1270,20 @@ function doSelect(body) {
         );
       }
 
-      for (const sliceName of Object.keys(
-        body.policy.requiredSlices
-      )) {
-        const value =
+      for (
+        const sliceName of Object.keys(
+          body.policy.requiredSlices
+        )
+      ) {
+        const actual =
           slices[sliceName];
 
-        if (value === null) {
+        if (actual === null) {
           codes.push(
             `MISSING_SLICE:${sliceName}`
           );
         } else if (
-          value <
+          actual <
           body.policy.requiredSlices[sliceName]
         ) {
           codes.push(
@@ -1203,7 +1295,7 @@ function doSelect(body) {
 
     /*
      * --------------------------------------------------------
-     * SIZE
+     * SIZE LIMIT
      * --------------------------------------------------------
      */
     if (
@@ -1225,7 +1317,7 @@ function doSelect(body) {
     let latencyMs = null;
 
     if (
-      latenciesValid &&
+      latencyObject &&
       Object.prototype.hasOwnProperty.call(
         body.latencies,
         candidate.name
@@ -1248,7 +1340,8 @@ function doSelect(body) {
       }
     } else {
       /*
-       * Cannot validate latency => cannot admit.
+       * Missing/invalid latency means latency cannot
+       * be validated, therefore candidate cannot be admitted.
        */
       codes.push(
         "LATENCY_LIMIT"
@@ -1257,19 +1350,24 @@ function doSelect(body) {
 
     /*
      * --------------------------------------------------------
-     * FINAL
+     * REASON CODES
      * --------------------------------------------------------
      */
     const reasonCodes =
-      sortCodes(codes);
+      sortedUniqueCodes(codes);
 
+    /*
+     * --------------------------------------------------------
+     * ADMISSION
+     * --------------------------------------------------------
+     */
     const admitted =
       candidate.status === "frozen" &&
-      lineageValid &&
+      lineageExact &&
       manifest !== null &&
       policyValid &&
-      candidateSetValid &&
-      rowsValid &&
+      candidateOrderValid &&
+      rowsAreValid &&
       aggregate !== null &&
       totalBytes !== null &&
       latencyMs !== null &&
@@ -1287,97 +1385,100 @@ function doSelect(body) {
   }
 
   /*
-   * --------------------------------------------------------
-   * RESULT ORDER
-   * --------------------------------------------------------
+   * Results follow candidateOrder.
+   * UTF-8 name is fallback.
    */
-  const order =
-    body.policy.candidateOrder;
-
   results.sort(
-    makeResultComparator(order)
+    resultComparator(
+      body.policy.candidateOrder
+    )
   );
 
   /*
-   * --------------------------------------------------------
+   * ----------------------------------------------------------
    * WINNER
-   * --------------------------------------------------------
+   * ----------------------------------------------------------
    *
-   * smaller bytes
-   * then lower latency
-   * then candidate order
-   * then UTF-8 name
-   * --------------------------------------------------------
+   * 1. admitted only
+   * 2. smaller bytes
+   * 3. lower latency
+   * 4. candidateOrder
+   * 5. UTF-8 name
    */
-  const admitted =
+  const orderPosition = new Map();
+
+  body.policy.candidateOrder.forEach(
+    (name, index) => {
+      orderPosition.set(
+        name,
+        index
+      );
+    }
+  );
+
+  const admittedCandidates =
     results.filter(
-      r => r.admitted
+      result => result.admitted
     );
 
-  const positions = new Map();
-
-  if (Array.isArray(order)) {
-    order.forEach(
-      (name, index) => {
-        positions.set(
-          name,
-          index
+  admittedCandidates.sort(
+    (a, b) => {
+      if (
+        a.totalBytes !==
+        b.totalBytes
+      ) {
+        return (
+          a.totalBytes -
+          b.totalBytes
         );
       }
-    );
-  }
 
-  admitted.sort((a, b) => {
-    if (
-      a.totalBytes !==
-      b.totalBytes
-    ) {
-      return (
-        a.totalBytes -
-        b.totalBytes
-      );
-    }
-
-    if (
-      a.latencyMs !==
-      b.latencyMs
-    ) {
-      return (
-        a.latencyMs -
+      if (
+        a.latencyMs !==
         b.latencyMs
+      ) {
+        return (
+          a.latencyMs -
+          b.latencyMs
+        );
+      }
+
+      const ai =
+        orderPosition.has(a.name)
+          ? orderPosition.get(a.name)
+          : Number.MAX_SAFE_INTEGER;
+
+      const bi =
+        orderPosition.has(b.name)
+          ? orderPosition.get(b.name)
+          : Number.MAX_SAFE_INTEGER;
+
+      if (ai !== bi) {
+        return ai - bi;
+      }
+
+      return utf8Compare(
+        a.name,
+        b.name
       );
     }
-
-    const ai =
-      positions.has(a.name)
-        ? positions.get(a.name)
-        : Number.MAX_SAFE_INTEGER;
-
-    const bi =
-      positions.has(b.name)
-        ? positions.get(b.name)
-        : Number.MAX_SAFE_INTEGER;
-
-    if (ai !== bi) {
-      return ai - bi;
-    }
-
-    return utf8Compare(
-      a.name,
-      b.name
-    );
-  });
+  );
 
   let selected = null;
   let packageManifest = null;
 
-  if (admitted.length > 0) {
+  if (admittedCandidates.length > 0) {
     selected =
-      admitted[0].name;
+      admittedCandidates[0].name;
 
+    /*
+     * packageManifest must be exactly the recorded
+     * winner object.
+     */
     packageManifest =
       storedCandidates.find(
-        c => c.name === selected
+        candidate =>
+          candidate.name === selected
       );
   }
 
@@ -1393,84 +1494,10 @@ function doSelect(body) {
 }
 
 /* ============================================================
-   RESULT ORDER COMPARATOR
+   JSON BODY
 ============================================================ */
 
-function makeResultComparator(order) {
-  const positions = new Map();
-
-  if (Array.isArray(order)) {
-    order.forEach(
-      (name, index) => {
-        positions.set(
-          name,
-          index
-        );
-      }
-    );
-  }
-
-  return (a, b) => {
-    const ai =
-      positions.has(a.name)
-        ? positions.get(a.name)
-        : null;
-
-    const bi =
-      positions.has(b.name)
-        ? positions.get(b.name)
-        : null;
-
-    if (
-      ai !== null &&
-      bi !== null
-    ) {
-      return ai - bi;
-    }
-
-    if (ai !== null) {
-      return -1;
-    }
-
-    if (bi !== null) {
-      return 1;
-    }
-
-    return utf8Compare(
-      a.name,
-      b.name
-    );
-  };
-}
-
-/* ============================================================
-   HTTP RESPONSE
-============================================================ */
-
-function send(res, status, body) {
-  const text =
-    JSON.stringify(body);
-
-  res.writeHead(status, {
-    "Content-Type":
-      "application/json",
-    "Content-Length":
-      Buffer.byteLength(
-        text,
-        "utf8"
-      ),
-    "Cache-Control":
-      "no-store"
-  });
-
-  res.end(text);
-}
-
-/* ============================================================
-   REQUEST BODY
-============================================================ */
-
-function readJsonBody(req) {
+function readRequestBody(req) {
   return new Promise(
     (resolve, reject) => {
       const chunks = [];
@@ -1494,7 +1521,7 @@ function readJsonBody(req) {
               Buffer.concat(chunks);
 
             /*
-             * Decode complete request as UTF-8.
+             * Fatal UTF-8 decoding.
              */
             const decoder =
               new TextDecoder(
@@ -1511,8 +1538,8 @@ function readJsonBody(req) {
               JSON.parse(text);
 
             resolve(body);
-          } catch (err) {
-            reject(err);
+          } catch (error) {
+            reject(error);
           }
         }
       );
@@ -1526,22 +1553,68 @@ function readJsonBody(req) {
 }
 
 /* ============================================================
-   SERVER
+   RESPONSE
+============================================================ */
+
+function sendJson(
+  res,
+  status,
+  body
+) {
+  const text =
+    JSON.stringify(body);
+
+  res.writeHead(
+    status,
+    {
+      "Content-Type":
+        "application/json; charset=utf-8",
+
+      "Content-Length":
+        Buffer.byteLength(
+          text,
+          "utf8"
+        ),
+
+      "Cache-Control":
+        "no-store"
+    }
+  );
+
+  res.end(text);
+}
+
+/* ============================================================
+   HTTP SERVER
 ============================================================ */
 
 const server =
   http.createServer(
     async (req, res) => {
       /*
-       * ------------------------------------------------------
-       * HOME
-       * ------------------------------------------------------
+       * Health endpoint.
+       */
+      if (
+        req.method === "GET" &&
+        req.url === "/health"
+      ) {
+        return sendJson(
+          res,
+          200,
+          {
+            status: "ok"
+          }
+        );
+      }
+
+      /*
+       * Root endpoint.
        */
       if (
         req.method === "GET" &&
         req.url === "/"
       ) {
-        return send(
+        return sendJson(
           res,
           200,
           {
@@ -1553,33 +1626,13 @@ const server =
       }
 
       /*
-       * ------------------------------------------------------
-       * HEALTH
-       * ------------------------------------------------------
-       */
-      if (
-        req.method === "GET" &&
-        req.url === "/health"
-      ) {
-        return send(
-          res,
-          200,
-          {
-            status: "ok"
-          }
-        );
-      }
-
-      /*
-       * ------------------------------------------------------
-       * QUANTIZE
-       * ------------------------------------------------------
+       * ONLY endpoint required by grader.
        */
       if (
         req.method !== "POST" ||
         req.url !== "/quantize"
       ) {
-        return send(
+        return sendJson(
           res,
           404,
           {
@@ -1592,14 +1645,13 @@ const server =
 
       try {
         body =
-          await readJsonBody(req);
-      } catch {
-        return send(
+          await readRequestBody(req);
+      } catch (error) {
+        return sendJson(
           res,
           400,
           {
-            error:
-              "INVALID_INPUT"
+            error: "INVALID_INPUT"
           }
         );
       }
@@ -1607,44 +1659,49 @@ const server =
       let result;
 
       try {
+        /*
+         * Unknown/missing phase => exact 400.
+         */
         if (
-          body &&
-          body.phase === "freeze"
+          !isObject(body) ||
+          (
+            body.phase !== "freeze" &&
+            body.phase !== "select"
+          )
         ) {
-          result =
-            doFreeze(body);
-        } else if (
-          body &&
-          body.phase === "select"
-        ) {
-          result =
-            doSelect(body);
-        } else {
           result = {
             status: 400,
             body: {
-              error:
-                "INVALID_INPUT"
+              error: "INVALID_INPUT"
             }
           };
+        } else if (
+          body.phase === "freeze"
+        ) {
+          result =
+            handleFreeze(body);
+        } else {
+          result =
+            handleSelect(body);
         }
-      } catch (err) {
+      } catch (error) {
+        /*
+         * Log unexpected implementation errors.
+         */
         console.error(
-          "quantize processing error:",
-          err
+          "Quantize error:",
+          error
         );
 
-        return send(
-          res,
-          500,
-          {
-            error:
-              "INTERNAL_ERROR"
+        result = {
+          status: 500,
+          body: {
+            error: "INTERNAL_ERROR"
           }
-        );
+        };
       }
 
-      return send(
+      return sendJson(
         res,
         result.status,
         result.body
@@ -1652,9 +1709,15 @@ const server =
     }
   );
 
-/* ============================================================
-   START
-============================================================ */
+server.on(
+  "error",
+  error => {
+    console.error(
+      "Server error:",
+      error
+    );
+  }
+);
 
 server.listen(
   PORT,
@@ -1662,16 +1725,6 @@ server.listen(
   () => {
     console.log(
       `Quantize admission API listening on ${PORT}`
-    );
-  }
-);
-
-server.on(
-  "error",
-  err => {
-    console.error(
-      "Server error:",
-      err
     );
   }
 );
