@@ -1,1462 +1,1408 @@
-"use strict";
-
-const http = require("http");
-const crypto = require("crypto");
-
-const PORT = Number(process.env.PORT) || 10000;
-
-/*
- * Stateful freeze database.
- * This survives multiple requests while the process is alive.
- */
-const freezes = new Map();
-
-/* ============================================================
-   BASIC HELPERS
-============================================================ */
-
-function isObject(v) {
-  return v !== null && typeof v === "object" && !Array.isArray(v);
-}
-
-function nonEmptyString(v) {
-  return typeof v === "string" && v.length > 0;
-}
-
-function utf8Compare(a, b) {
-  return Buffer.compare(
-    Buffer.from(String(a), "utf8"),
-    Buffer.from(String(b), "utf8")
-  );
-}
-
-function sha256(value) {
-  return crypto
-    .createHash("sha256")
-    .update(value)
-    .digest("hex");
-}
-
-function round12(value) {
-  return Number(value.toFixed(12));
-}
-
-function safeNonNegativeInteger(v) {
-  return (
-    typeof v === "number" &&
-    Number.isSafeInteger(v) &&
-    v >= 0
-  );
-}
-
-function finiteNonNegative(v) {
-  return (
-    typeof v === "number" &&
-    Number.isFinite(v) &&
-    v >= 0
-  );
-}
-
-function validFloor(v) {
-  return (
-    typeof v === "number" &&
-    Number.isFinite(v) &&
-    v >= 0 &&
-    v <= 1
-  );
-}
-
-function binaryPrediction(v) {
-  return (
-    typeof v === "number" &&
-    Number.isInteger(v) &&
-    (v === 0 || v === 1)
-  );
-}
-
-function sortCodes(codes) {
-  return [...new Set(codes)].sort(utf8Compare);
-}
-
-/*
- * Used only for comparing freeze requests.
- * Object key order does not affect equality.
- * Array order DOES affect equality.
- */
-function canonical(v) {
-  if (Array.isArray(v)) {
-    return v.map(canonical);
-  }
-
-  if (isObject(v)) {
-    const result = {};
-
-    for (const key of Object.keys(v).sort(utf8Compare)) {
-      result[key] = canonical(v[key]);
-    }
-
-    return result;
-  }
-
-  return v;
-}
-
-function deepEqual(a, b) {
-  return (
-    JSON.stringify(canonical(a)) ===
-    JSON.stringify(canonical(b))
-  );
-}
-
-/* ============================================================
-   FILE MANIFEST
-============================================================ */
-
-function makeManifest(files) {
-  if (!isObject(files)) {
-    return null;
-  }
-
-  const filenames = Object.keys(files);
-
-  if (filenames.length === 0) {
-    return null;
-  }
-
-  for (const filename of filenames) {
-    if (!nonEmptyString(filename)) {
-      return null;
-    }
-
-    /*
-     * File text is DATA.
-     * Never execute/evaluate it.
-     */
-    if (typeof files[filename] !== "string") {
-      return null;
-    }
-  }
-
-  filenames.sort(utf8Compare);
-
-  const inventory = [];
-
-  for (const filename of filenames) {
-    const data = Buffer.from(files[filename], "utf8");
-
-    inventory.push({
-      name: filename,
-      bytes: data.length,
-      sha256: sha256(data)
-    });
-  }
-
-  let totalBytes = 0;
-
-  for (const item of inventory) {
-    totalBytes += item.bytes;
-
-    if (!Number.isSafeInteger(totalBytes)) {
-      return null;
-    }
-  }
-
-  /*
-   * Exact required key order:
-   * name, bytes, sha256
-   *
-   * JSON.stringify is compact.
-   */
-  const packageDigest = sha256(
-    Buffer.from(JSON.stringify(inventory), "utf8")
-  );
-
-  return {
-    inventory,
-    totalBytes,
-    packageDigest
-  };
-}
-
-/* ============================================================
-   RECORDED MANIFEST VALIDATION
-============================================================ */
-
-function validateManifest(candidate) {
-  if (!isObject(candidate)) {
-    return null;
-  }
-
-  if (!Array.isArray(candidate.inventory)) {
-    return null;
-  }
-
-  const inventory = [];
-  const names = new Set();
-
-  for (const item of candidate.inventory) {
-    if (!isObject(item)) {
-      return null;
-    }
-
-    if (!nonEmptyString(item.name)) {
-      return null;
-    }
-
-    if (names.has(item.name)) {
-      return null;
-    }
-
-    names.add(item.name);
-
-    if (!safeNonNegativeInteger(item.bytes)) {
-      return null;
-    }
-
-    if (
-      typeof item.sha256 !== "string" ||
-      !/^[0-9a-f]{64}$/.test(item.sha256)
-    ) {
-      return null;
-    }
-
-    inventory.push({
-      name: item.name,
-      bytes: item.bytes,
-      sha256: item.sha256
-    });
-  }
-
-  /*
-   * Must already be sorted by UTF-8 filename.
-   */
-  const sorted = [...inventory].sort(
-    (a, b) => utf8Compare(a.name, b.name)
-  );
-
-  if (!deepEqual(inventory, sorted)) {
-    return null;
-  }
-
-  let totalBytes = 0;
-
-  for (const item of inventory) {
-    totalBytes += item.bytes;
-
-    if (!Number.isSafeInteger(totalBytes)) {
-      return null;
-    }
-  }
-
-  /*
-   * Recompute instead of trusting supplied totalBytes.
-   */
-  if (candidate.totalBytes !== totalBytes) {
-    return null;
-  }
-
-  const packageDigest = sha256(
-    Buffer.from(JSON.stringify(inventory), "utf8")
-  );
-
-  /*
-   * Recompute instead of trusting supplied digest.
-   */
-  if (candidate.packageDigest !== packageDigest) {
-    return null;
-  }
-
-  return {
-    inventory,
-    totalBytes,
-    packageDigest
-  };
-}
-
-/* ============================================================
-   FREEZE TOP-LEVEL VALIDATION
-============================================================ */
-
-function validFreezeRequest(body) {
-  if (!isObject(body)) {
-    return false;
-  }
-
-  if (body.phase !== "freeze") {
-    return false;
-  }
-
-  if (!nonEmptyString(body.freezeId)) {
-    return false;
-  }
-
-  if (body.freezeId.length > 128) {
-    return false;
-  }
-
-  if (!nonEmptyString(body.calibrationDigest)) {
-    return false;
-  }
-
-  if (!nonEmptyString(body.tokenizerDigest)) {
-    return false;
-  }
-
-  if (!Array.isArray(body.allowedUnsupportedReasons)) {
-    return false;
-  }
-
-  const reasons = new Set();
-
-  for (const reason of body.allowedUnsupportedReasons) {
-    if (!nonEmptyString(reason)) {
-      return false;
-    }
-
-    if (reasons.has(reason)) {
-      return false;
-    }
-
-    reasons.add(reason);
-  }
-
-  /*
-   * Explicit assignment requirement:
-   * empty/non-array freeze candidate list => 400.
-   */
-  if (
-    !Array.isArray(body.candidates) ||
-    body.candidates.length === 0
-  ) {
-    return false;
-  }
-
-  /*
-   * Candidate names are request structure.
-   */
-  const names = new Set();
-
-  for (const candidate of body.candidates) {
-    if (!isObject(candidate)) {
-      return false;
-    }
-
-    if (!nonEmptyString(candidate.name)) {
-      return false;
-    }
-
-    if (names.has(candidate.name)) {
-      return false;
-    }
-
-    names.add(candidate.name);
-  }
-
-  return true;
-}
-
-/* ============================================================
-   FREEZE
-============================================================ */
-
-function freeze(body) {
-  if (!validFreezeRequest(body)) {
-    return {
-      status: 400,
-      body: {
-        error: "INVALID_INPUT"
-      }
-    };
-  }
-
-  /*
-   * Replay / conflict.
-   */
-  const previous = freezes.get(body.freezeId);
-
-  if (previous) {
-    if (deepEqual(previous.request, body)) {
-      return {
-        status: 200,
-        body: previous.response
-      };
-    }
-
-    return {
-      status: 409,
-      body: {
-        error: "FREEZE_ID_CONFLICT"
-      }
-    };
-  }
-
-  const resultCandidates = [];
-
-  for (const candidate of body.candidates) {
-    const manifest = makeManifest(candidate.files);
-
-    /*
-     * Invalid files affect only this candidate.
-     */
-    if (manifest === null) {
-      resultCandidates.push({
-        name: candidate.name,
-        status: "invalid",
-        inventory: [],
-        totalBytes: null,
-        packageDigest: null,
-        reasonCodes: ["INVALID_INPUT"]
-      });
-
-      continue;
-    }
-
-    const codes = [];
-
-    /*
-     * Candidate fields.
-     */
-    if (
-      candidate.loadable !== true &&
-      candidate.loadable !== false
-    ) {
-      codes.push("INVALID_INPUT");
-    }
-
-    if (!nonEmptyString(candidate.calibrationDigest)) {
-      codes.push("INVALID_INPUT");
-    }
-
-    if (!nonEmptyString(candidate.tokenizerDigest)) {
-      codes.push("INVALID_INPUT");
-    }
-
-    if (
-      candidate.unsupportedReason !== undefined &&
-      candidate.unsupportedReason !== null &&
-      typeof candidate.unsupportedReason !== "string"
-    ) {
-      codes.push("INVALID_INPUT");
-    }
-
-    if (codes.length > 0) {
-      resultCandidates.push({
-        name: candidate.name,
-        status: "invalid",
-        inventory: [],
-        totalBytes: null,
-        packageDigest: null,
-        reasonCodes: sortCodes(codes)
-      });
-
-      continue;
-    }
-
-    /*
-     * Unsupported reason.
-     */
-    const unsupported =
-      typeof candidate.unsupportedReason === "string" &&
-      candidate.unsupportedReason.length > 0;
-
-    if (unsupported) {
-      if (
-        !body.allowedUnsupportedReasons.includes(
-          candidate.unsupportedReason
+import hashlib
+import json
+import math
+import threading
+
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse
+
+app = FastAPI()
+
+FREEZES = {}
+LOCK = threading.Lock()
+
+SAFE_MAX = 9007199254740991
+
+
+# ============================================================
+# HELPERS
+# ============================================================
+
+def utf8(value):
+    return value.encode("utf-8")
+
+
+def sha256(value):
+    return hashlib.sha256(value).hexdigest()
+
+
+def compact_json(value):
+    return json.dumps(
+        value,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        allow_nan=False
+    ).encode("utf-8")
+
+
+def sort_codes(codes):
+    return sorted(
+        set(codes),
+        key=utf8
+    )
+
+
+def finite(value):
+    return (
+        isinstance(value, (int, float))
+        and not isinstance(value, bool)
+        and math.isfinite(float(value))
+    )
+
+
+def safe_integer(value):
+    return (
+        isinstance(value, int)
+        and not isinstance(value, bool)
+        and 0 <= value <= SAFE_MAX
+    )
+
+
+def binary(value):
+    if isinstance(value, bool):
+        return False
+
+    if isinstance(value, int):
+        return value == 0 or value == 1
+
+    if isinstance(value, float):
+        return (
+            math.isfinite(value)
+            and (value == 0.0 or value == 1.0)
         )
-      ) {
-        resultCandidates.push({
-          name: candidate.name,
-          status: "invalid",
-          inventory: [],
-          totalBytes: null,
-          packageDigest: null,
-          reasonCodes: [
-            "UNALLOWED_UNSUPPORTED_REASON"
-          ]
-        });
 
-        continue;
-      }
+    return False
 
-      resultCandidates.push({
-        name: candidate.name,
-        status: "unsupported",
-        inventory: manifest.inventory,
-        totalBytes: manifest.totalBytes,
-        packageDigest: manifest.packageDigest,
-        reasonCodes: []
-      });
 
-      continue;
-    }
+# ============================================================
+# FILE INVENTORY
+# ============================================================
 
-    /*
-     * Normal frozen candidate.
-     */
-    if (candidate.loadable !== true) {
-      codes.push("NOT_LOADABLE");
-    }
+def make_inventory(files):
+    if not isinstance(files, dict) or len(files) == 0:
+        return [], None, None, False
 
-    if (
-      candidate.calibrationDigest !==
-      body.calibrationDigest
-    ) {
-      codes.push("CALIBRATION_MISMATCH");
-    }
+    inventory = []
+    seen = set()
 
-    if (
-      candidate.tokenizerDigest !==
-      body.tokenizerDigest
-    ) {
-      codes.push("TOKENIZER_MISMATCH");
-    }
+    for filename, text in files.items():
 
-    if (codes.length > 0) {
-      resultCandidates.push({
-        name: candidate.name,
-        status: "invalid",
-        inventory: [],
-        totalBytes: null,
-        packageDigest: null,
-        reasonCodes: sortCodes(codes)
-      });
+        if not isinstance(filename, str) or filename == "":
+            return [], None, None, False
 
-      continue;
-    }
+        name_bytes = utf8(filename)
 
-    resultCandidates.push({
-      name: candidate.name,
-      status: "frozen",
-      inventory: manifest.inventory,
-      totalBytes: manifest.totalBytes,
-      packageDigest: manifest.packageDigest,
-      reasonCodes: []
-    });
-  }
+        if name_bytes in seen:
+            return [], None, None, False
 
-  resultCandidates.sort(
-    (a, b) => utf8Compare(a.name, b.name)
-  );
+        seen.add(name_bytes)
 
-  const response = {
-    freezeId: body.freezeId,
-    candidates: resultCandidates
-  };
+        # File content is DATA.
+        if not isinstance(text, str):
+            return [], None, None, False
 
-  /*
-   * Persist complete response.
-   */
-  freezes.set(body.freezeId, {
-    request: JSON.parse(JSON.stringify(body)),
-    response: JSON.parse(JSON.stringify(response))
-  });
+        raw = text.encode("utf-8")
 
-  return {
-    status: 200,
-    body: response
-  };
-}
+        inventory.append({
+            "name": filename,
+            "bytes": len(raw),
+            "sha256": sha256(raw)
+        })
 
-/* ============================================================
-   SELECT TOP-LEVEL VALIDATION
-============================================================ */
+    inventory.sort(
+        key=lambda item: utf8(item["name"])
+    )
 
-function validSelectEnvelope(body) {
-  if (!isObject(body)) {
-    return false;
-  }
+    total = 0
 
-  if (body.phase !== "select") {
-    return false;
-  }
+    for item in inventory:
+        total += item["bytes"]
 
-  if (!nonEmptyString(body.freezeId)) {
-    return false;
-  }
+        if total > SAFE_MAX:
+            return [], None, None, False
 
-  /*
-   * Arrays may be empty.
-   */
-  if (!Array.isArray(body.candidates)) {
-    return false;
-  }
+    package_digest = sha256(
+        compact_json(inventory)
+    )
 
-  if (!Array.isArray(body.rows)) {
-    return false;
-  }
+    return (
+        inventory,
+        total,
+        package_digest,
+        True
+    )
 
-  if (!isObject(body.policy)) {
-    return false;
-  }
 
-  return true;
-}
+# ============================================================
+# FREEZE INPUT
+# ============================================================
 
-/* ============================================================
-   POLICY
-============================================================ */
+def valid_freeze(body):
+    if not isinstance(body, dict):
+        return False
 
-function validatePolicy(policy) {
-  if (!isObject(policy)) {
-    return false;
-  }
+    if body.get("phase") != "freeze":
+        return False
 
-  if (!safeNonNegativeInteger(policy.maxBytes)) {
-    return false;
-  }
-
-  if (!validFloor(policy.aggregateFloor)) {
-    return false;
-  }
-
-  if (!isObject(policy.requiredSlices)) {
-    return false;
-  }
-
-  for (const name of Object.keys(policy.requiredSlices)) {
-    if (!nonEmptyString(name)) {
-      return false;
-    }
-
-    if (!validFloor(policy.requiredSlices[name])) {
-      return false;
-    }
-  }
-
-  if (!finiteNonNegative(policy.maxLatencyMs)) {
-    return false;
-  }
-
-  if (!Array.isArray(policy.candidateOrder)) {
-    return false;
-  }
-
-  const names = new Set();
-
-  for (const name of policy.candidateOrder) {
-    if (!nonEmptyString(name)) {
-      return false;
-    }
-
-    if (names.has(name)) {
-      return false;
-    }
-
-    names.add(name);
-  }
-
-  return true;
-}
-
-/* ============================================================
-   ROW VALIDATION
-============================================================ */
-
-function validateRows(rows) {
-  if (!Array.isArray(rows)) {
-    return false;
-  }
-
-  for (const row of rows) {
-    if (!isObject(row)) {
-      return false;
-    }
+    freeze_id = body.get("freezeId")
 
     if (
-      !Object.prototype.hasOwnProperty.call(
-        row,
-        "label"
-      )
-    ) {
-      return false;
-    }
-
-    if (!binaryPrediction(row.label)) {
-      return false;
-    }
-
-    if (!nonEmptyString(row.slice)) {
-      return false;
-    }
-
-    if (!isObject(row.predictions)) {
-      return false;
-    }
-  }
-
-  return true;
-}
-
-/* ============================================================
-   SET VALIDATION
-============================================================ */
-
-function sameUniqueSet(a, b) {
-  if (!Array.isArray(a) || !Array.isArray(b)) {
-    return false;
-  }
-
-  const sa = new Set(a);
-  const sb = new Set(b);
-
-  if (sa.size !== a.length) {
-    return false;
-  }
-
-  if (sb.size !== b.length) {
-    return false;
-  }
-
-  if (sa.size !== sb.size) {
-    return false;
-  }
-
-  for (const value of sa) {
-    if (!sb.has(value)) {
-      return false;
-    }
-  }
-
-  return true;
-}
-
-/* ============================================================
-   METRICS
-============================================================ */
-
-function calculateMetrics(
-  candidateName,
-  rows,
-  requiredSlices
-) {
-  const nullSlices = {};
-
-  for (const sliceName of Object.keys(requiredSlices)) {
-    nullSlices[sliceName] = null;
-  }
-
-  /*
-   * No rows => no valid prediction measurement.
-   */
-  if (rows.length === 0) {
-    return {
-      valid: false,
-      aggregate: null,
-      slices: nullSlices
-    };
-  }
-
-  let correct = 0;
-
-  for (const row of rows) {
-    if (
-      !Object.prototype.hasOwnProperty.call(
-        row.predictions,
-        candidateName
-      )
-    ) {
-      return {
-        valid: false,
-        aggregate: null,
-        slices: nullSlices
-      };
-    }
-
-    const prediction =
-      row.predictions[candidateName];
-
-    if (!binaryPrediction(prediction)) {
-      return {
-        valid: false,
-        aggregate: null,
-        slices: nullSlices
-      };
-    }
-
-    if (prediction === row.label) {
-      correct++;
-    }
-  }
-
-  const aggregate =
-    round12(correct / rows.length);
-
-  const slices = {};
-
-  for (const sliceName of Object.keys(requiredSlices)) {
-    const sliceRows = rows.filter(
-      row => row.slice === sliceName
-    );
-
-    if (sliceRows.length === 0) {
-      slices[sliceName] = null;
-      continue;
-    }
-
-    let sliceCorrect = 0;
-
-    for (const row of sliceRows) {
-      const prediction =
-        row.predictions[candidateName];
-
-      if (!binaryPrediction(prediction)) {
-        return {
-          valid: false,
-          aggregate: null,
-          slices: nullSlices
-        };
-      }
-
-      if (prediction === row.label) {
-        sliceCorrect++;
-      }
-    }
-
-    slices[sliceName] =
-      round12(
-        sliceCorrect / sliceRows.length
-      );
-  }
-
-  return {
-    valid: true,
-    aggregate,
-    slices
-  };
-}
-
-/* ============================================================
-   RESULT SORT
-============================================================ */
-
-function sortResults(results, candidateOrder) {
-  const position = new Map();
-
-  if (Array.isArray(candidateOrder)) {
-    candidateOrder.forEach(
-      (name, index) => {
-        position.set(name, index);
-      }
-    );
-  }
-
-  results.sort((a, b) => {
-    const ai = position.has(a.name)
-      ? position.get(a.name)
-      : null;
-
-    const bi = position.has(b.name)
-      ? position.get(b.name)
-      : null;
-
-    if (ai !== null && bi !== null) {
-      return ai - bi;
-    }
-
-    if (ai !== null) {
-      return -1;
-    }
-
-    if (bi !== null) {
-      return 1;
-    }
-
-    return utf8Compare(a.name, b.name);
-  });
-}
-
-/* ============================================================
-   SELECT
-============================================================ */
-
-function select(body) {
-  /*
-   * IMPORTANT:
-   *
-   * This is the ONLY select-level 400 check.
-   *
-   * Candidate contents are NOT individually rejected with 400.
-   */
-  if (!validSelectEnvelope(body)) {
-    return {
-      status: 400,
-      body: {
-        error: "INVALID_INPUT"
-      }
-    };
-  }
-
-  /*
-   * Unknown freeze ID.
-   */
-  if (!freezes.has(body.freezeId)) {
-    const order =
-      Array.isArray(body.policy.candidateOrder)
-        ? body.policy.candidateOrder
-        : [];
-
-    const results = body.candidates.map(
-      candidate => ({
-        name:
-          isObject(candidate) &&
-          nonEmptyString(candidate.name)
-            ? candidate.name
-            : "",
-        aggregate: null,
-        slices: {},
-        totalBytes: null,
-        latencyMs: null,
-        admitted: false,
-        reasonCodes: ["NOT_FROZEN"]
-      })
-    );
-
-    sortResults(results, order);
-
-    return {
-      status: 200,
-      body: {
-        freezeId: body.freezeId,
-        selected: null,
-        results,
-        packageManifest: null
-      }
-    };
-  }
-
-  const frozen =
-    freezes.get(body.freezeId);
-
-  const storedCandidates =
-    frozen.response.candidates;
-
-  const storedNames =
-    storedCandidates.map(
-      candidate => candidate.name
-    );
-
-  const submittedNames =
-    body.candidates.map(candidate =>
-      isObject(candidate)
-        ? candidate.name
-        : undefined
-    );
-
-  /*
-   * Exact candidate array comparison.
-   */
-  const exactLineage =
-    deepEqual(
-      body.candidates,
-      storedCandidates
-    );
-
-  /*
-   * Policy.
-   */
-  const policyValid =
-    validatePolicy(body.policy);
-
-  /*
-   * Candidate order unique set.
-   */
-  const candidateOrderValid =
-    policyValid &&
-    sameUniqueSet(
-      storedNames,
-      body.policy.candidateOrder
-    );
-
-  /*
-   * Rows.
-   */
-  const rowsValid =
-    validateRows(body.rows);
-
-  /*
-   * Latencies.
-   */
-  const latencyObject =
-    isObject(body.latencies);
-
-  const results = [];
-
-  for (const candidate of storedCandidates) {
-    const codes = [];
-
-    /*
-     * --------------------------------------------------------
-     * LINEAGE
-     * --------------------------------------------------------
-     */
-    if (!exactLineage) {
-      codes.push("INVALID_LINEAGE");
-    }
-
-    /*
-     * --------------------------------------------------------
-     * FROZEN
-     * --------------------------------------------------------
-     */
-    if (candidate.status !== "frozen") {
-      codes.push("NOT_FROZEN");
-    }
-
-    /*
-     * --------------------------------------------------------
-     * MANIFEST
-     * --------------------------------------------------------
-     */
-    const manifest =
-      validateManifest(candidate);
-
-    let totalBytes = null;
-
-    if (manifest === null) {
-      codes.push("INVALID_MANIFEST");
-    } else {
-      totalBytes = manifest.totalBytes;
-    }
-
-    /*
-     * --------------------------------------------------------
-     * POLICY
-     * --------------------------------------------------------
-     */
-    if (!policyValid || !candidateOrderValid) {
-      codes.push("INVALID_POLICY");
-    }
-
-    /*
-     * --------------------------------------------------------
-     * PREDICTIONS
-     * --------------------------------------------------------
-     */
-    let aggregate = null;
-    let slices = {};
-
-    if (rowsValid && policyValid) {
-      const metrics =
-        calculateMetrics(
-          candidate.name,
-          body.rows,
-          body.policy.requiredSlices
-        );
-
-      aggregate = metrics.aggregate;
-      slices = metrics.slices;
-
-      if (!metrics.valid) {
-        codes.push("INVALID_PREDICTIONS");
-      }
-    } else {
-      codes.push("INVALID_PREDICTIONS");
-
-      if (policyValid) {
-        for (
-          const sliceName of Object.keys(
-            body.policy.requiredSlices
-          )
-        ) {
-          slices[sliceName] = null;
-        }
-      }
-    }
-
-    /*
-     * --------------------------------------------------------
-     * AGGREGATE + SLICES
-     * --------------------------------------------------------
-     */
-    if (
-      policyValid &&
-      rowsValid &&
-      aggregate !== null
-    ) {
-      if (
-        aggregate <
-        body.policy.aggregateFloor
-      ) {
-        codes.push("AGGREGATE_FLOOR");
-      }
-
-      for (
-        const sliceName of Object.keys(
-          body.policy.requiredSlices
-        )
-      ) {
-        const value =
-          slices[sliceName];
-
-        if (value === null) {
-          codes.push(
-            `MISSING_SLICE:${sliceName}`
-          );
-        } else if (
-          value <
-          body.policy.requiredSlices[sliceName]
-        ) {
-          codes.push(
-            `SLICE_FLOOR:${sliceName}`
-          );
-        }
-      }
-    }
-
-    /*
-     * --------------------------------------------------------
-     * SIZE
-     * --------------------------------------------------------
-     */
-    if (
-      policyValid &&
-      totalBytes !== null &&
-      totalBytes >
-        body.policy.maxBytes
-    ) {
-      codes.push("SIZE_LIMIT");
-    }
-
-    /*
-     * --------------------------------------------------------
-     * LATENCY
-     * --------------------------------------------------------
-     */
-    let latencyMs = null;
+        not isinstance(freeze_id, str)
+        or len(freeze_id) == 0
+        or len(freeze_id) > 128
+    ):
+        return False
+
+    calibration = body.get("calibrationDigest")
 
     if (
-      latencyObject &&
-      Object.prototype.hasOwnProperty.call(
-        body.latencies,
-        candidate.name
-      ) &&
-      finiteNonNegative(
-        body.latencies[candidate.name]
-      )
-    ) {
-      latencyMs =
-        body.latencies[candidate.name];
+        not isinstance(calibration, str)
+        or len(calibration) == 0
+    ):
+        return False
 
-      if (
-        policyValid &&
-        latencyMs >
-          body.policy.maxLatencyMs
-      ) {
-        codes.push("LATENCY_LIMIT");
-      }
-    } else {
-      /*
-       * Cannot validate latency.
-       */
-      codes.push("LATENCY_LIMIT");
-    }
+    tokenizer = body.get("tokenizerDigest")
 
-    /*
-     * --------------------------------------------------------
-     * FINAL CODES
-     * --------------------------------------------------------
-     */
-    const reasonCodes =
-      sortCodes(codes);
+    if (
+        not isinstance(tokenizer, str)
+        or len(tokenizer) == 0
+    ):
+        return False
 
-    const admitted =
-      candidate.status === "frozen" &&
-      exactLineage &&
-      manifest !== null &&
-      policyValid &&
-      candidateOrderValid &&
-      rowsValid &&
-      aggregate !== null &&
-      totalBytes !== null &&
-      latencyMs !== null &&
-      reasonCodes.length === 0;
+    allowed = body.get(
+        "allowedUnsupportedReasons"
+    )
 
-    results.push({
-      name: candidate.name,
-      aggregate,
-      slices,
-      totalBytes,
-      latencyMs,
-      admitted,
-      reasonCodes
-    });
-  }
+    if not isinstance(allowed, list):
+        return False
 
-  /*
-   * Result ordering.
-   */
-  sortResults(
-    results,
-    body.policy.candidateOrder
-  );
+    allowed_seen = set()
 
-  /*
-   * Winner:
-   *   1. smallest bytes
-   *   2. lowest latency
-   *   3. candidateOrder
-   *   4. UTF-8 name
-   */
-  const orderPosition = new Map();
-
-  if (Array.isArray(body.policy.candidateOrder)) {
-    body.policy.candidateOrder.forEach(
-      (name, index) => {
-        orderPosition.set(name, index);
-      }
-    );
-  }
-
-  const winners =
-    results.filter(
-      result => result.admitted
-    );
-
-  winners.sort((a, b) => {
-    if (a.totalBytes !== b.totalBytes) {
-      return a.totalBytes - b.totalBytes;
-    }
-
-    if (a.latencyMs !== b.latencyMs) {
-      return a.latencyMs - b.latencyMs;
-    }
-
-    const ai = orderPosition.has(a.name)
-      ? orderPosition.get(a.name)
-      : Number.MAX_SAFE_INTEGER;
-
-    const bi = orderPosition.has(b.name)
-      ? orderPosition.get(b.name)
-      : Number.MAX_SAFE_INTEGER;
-
-    if (ai !== bi) {
-      return ai - bi;
-    }
-
-    return utf8Compare(a.name, b.name);
-  });
-
-  let selected = null;
-  let packageManifest = null;
-
-  if (winners.length > 0) {
-    selected = winners[0].name;
-
-    /*
-     * Exactly the recorded winner object.
-     */
-    packageManifest =
-      storedCandidates.find(
-        candidate =>
-          candidate.name === selected
-      );
-  }
-
-  return {
-    status: 200,
-    body: {
-      freezeId: body.freezeId,
-      selected,
-      results,
-      packageManifest
-    }
-  };
-}
-
-/* ============================================================
-   HTTP BODY
-============================================================ */
-
-function readJson(req) {
-  return new Promise((resolve, reject) => {
-    const chunks = [];
-
-    req.on("data", chunk => {
-      chunks.push(
-        Buffer.isBuffer(chunk)
-          ? chunk
-          : Buffer.from(chunk)
-      );
-    });
-
-    req.on("end", () => {
-      try {
-        const buffer =
-          Buffer.concat(chunks);
-
-        const decoder =
-          new TextDecoder("utf-8", {
-            fatal: true
-          });
-
-        const text =
-          decoder.decode(buffer);
-
-        resolve(JSON.parse(text));
-      } catch (error) {
-        reject(error);
-      }
-    });
-
-    req.on("error", reject);
-  });
-}
-
-/* ============================================================
-   RESPONSE
-============================================================ */
-
-function sendJson(res, status, body) {
-  const text = JSON.stringify(body);
-
-  res.writeHead(status, {
-    "Content-Type":
-      "application/json; charset=utf-8",
-
-    "Content-Length":
-      Buffer.byteLength(text, "utf8"),
-
-    "Cache-Control":
-      "no-store"
-  });
-
-  res.end(text);
-}
-
-/* ============================================================
-   SERVER
-============================================================ */
-
-const server =
-  http.createServer(
-    async (req, res) => {
-      /*
-       * Health.
-       */
-      if (
-        req.method === "GET" &&
-        req.url === "/health"
-      ) {
-        return sendJson(
-          res,
-          200,
-          { status: "ok" }
-        );
-      }
-
-      /*
-       * Root.
-       */
-      if (
-        req.method === "GET" &&
-        req.url === "/"
-      ) {
-        return sendJson(
-          res,
-          200,
-          {
-            service:
-              "quantize-admission-api",
-            status: "ok"
-          }
-        );
-      }
-
-      /*
-       * Grader endpoint.
-       */
-      if (
-        req.method !== "POST" ||
-        req.url !== "/quantize"
-      ) {
-        return sendJson(
-          res,
-          404,
-          {
-            error: "NOT_FOUND"
-          }
-        );
-      }
-
-      let body;
-
-      try {
-        body = await readJson(req);
-      } catch {
-        return sendJson(
-          res,
-          400,
-          {
-            error: "INVALID_INPUT"
-          }
-        );
-      }
-
-      let result;
-
-      try {
-        /*
-         * Unknown or missing phase.
-         */
+    for reason in allowed:
         if (
-          !isObject(body) ||
-          (
-            body.phase !== "freeze" &&
-            body.phase !== "select"
-          )
-        ) {
-          result = {
-            status: 400,
-            body: {
-              error: "INVALID_INPUT"
-            }
-          };
-        } else if (
-          body.phase === "freeze"
-        ) {
-          result = freeze(body);
-        } else {
-          result = select(body);
+            not isinstance(reason, str)
+            or len(reason) == 0
+        ):
+            return False
+
+        key = utf8(reason)
+
+        if key in allowed_seen:
+            return False
+
+        allowed_seen.add(key)
+
+    candidates = body.get("candidates")
+
+    if not isinstance(candidates, list):
+        return False
+
+    if len(candidates) == 0:
+        return False
+
+    candidate_names = set()
+
+    for candidate in candidates:
+
+        if not isinstance(candidate, dict):
+            return False
+
+        name = candidate.get("name")
+
+        if (
+            not isinstance(name, str)
+            or len(name) == 0
+        ):
+            return False
+
+        key = utf8(name)
+
+        if key in candidate_names:
+            return False
+
+        candidate_names.add(key)
+
+    return True
+
+
+# ============================================================
+# FREEZE
+# ============================================================
+
+def process_freeze(body):
+
+    freeze_id = body["freezeId"]
+
+    with LOCK:
+
+        # ----------------------------------------------------
+        # REPLAY / CONFLICT
+        # ----------------------------------------------------
+
+        if freeze_id in FREEZES:
+
+            previous = FREEZES[freeze_id]
+
+            if previous["input"] == body:
+                return previous["output"], 200
+
+            return {
+                "error": "FREEZE_ID_CONFLICT"
+            }, 409
+
+        request_calibration = body[
+            "calibrationDigest"
+        ]
+
+        request_tokenizer = body[
+            "tokenizerDigest"
+        ]
+
+        allowed = set(
+            body["allowedUnsupportedReasons"]
+        )
+
+        # ----------------------------------------------------
+        # CANDIDATE SORTING
+        # ----------------------------------------------------
+
+        candidates = sorted(
+            body["candidates"],
+            key=lambda c: utf8(c["name"])
+        )
+
+        output_candidates = []
+
+        # ----------------------------------------------------
+        # PROCESS EACH CANDIDATE
+        # ----------------------------------------------------
+
+        for candidate in candidates:
+
+            name = candidate["name"]
+
+            codes = []
+
+            # =================================================
+            # FILES
+            # =================================================
+
+            (
+                inventory,
+                total_bytes,
+                package_digest,
+                files_ok
+            ) = make_inventory(
+                candidate.get("files")
+            )
+
+            if not files_ok:
+                inventory = []
+                total_bytes = None
+                package_digest = None
+
+                codes.append(
+                    "INVALID_INPUT"
+                )
+
+            # =================================================
+            # UNSUPPORTED REASON
+            # =================================================
+
+            has_reason = (
+                "unsupportedReason" in candidate
+                and candidate.get(
+                    "unsupportedReason"
+                ) is not None
+                and candidate.get(
+                    "unsupportedReason"
+                ) != ""
+            )
+
+            if has_reason:
+
+                reason = candidate.get(
+                    "unsupportedReason"
+                )
+
+                if (
+                    isinstance(reason, str)
+                    and reason in allowed
+                ):
+                    status = "unsupported"
+
+                else:
+                    status = "invalid"
+
+                    codes.append(
+                        "UNALLOWED_UNSUPPORTED_REASON"
+                    )
+
+            else:
+
+                status = "frozen"
+
+                # =============================================
+                # LOADABLE
+                # =============================================
+
+                if candidate.get("loadable") is not True:
+                    codes.append(
+                        "NOT_LOADABLE"
+                    )
+
+                # =============================================
+                # CALIBRATION
+                # =============================================
+
+                if (
+                    candidate.get(
+                        "calibrationDigest"
+                    )
+                    != request_calibration
+                ):
+                    codes.append(
+                        "CALIBRATION_MISMATCH"
+                    )
+
+                # =============================================
+                # TOKENIZER
+                # =============================================
+
+                if (
+                    candidate.get(
+                        "tokenizerDigest"
+                    )
+                    != request_tokenizer
+                ):
+                    codes.append(
+                        "TOKENIZER_MISMATCH"
+                    )
+
+            # =================================================
+            # ANY REASON => INVALID
+            # =================================================
+
+            if codes and status != "unsupported":
+                status = "invalid"
+
+            output_candidates.append({
+                "name": name,
+                "status": status,
+                "inventory": inventory,
+                "totalBytes": total_bytes,
+                "packageDigest": package_digest,
+                "reasonCodes": sort_codes(codes)
+            })
+
+        # =====================================================
+        # EXACT RESPONSE
+        # =====================================================
+
+        output = {
+            "freezeId": freeze_id,
+            "candidates": output_candidates
         }
-      } catch (error) {
-        console.error(
-          "Unhandled /quantize error:",
-          error
-        );
 
-        result = {
-          status: 500,
-          body: {
-            error: "INTERNAL_ERROR"
-          }
-        };
-      }
+        # =====================================================
+        # PERSIST COMPLETE RESPONSE
+        # =====================================================
 
-      return sendJson(
-        res,
-        result.status,
-        result.body
-      );
+        FREEZES[freeze_id] = {
+            "input": json.loads(
+                json.dumps(body, ensure_ascii=False)
+            ),
+            "output": json.loads(
+                json.dumps(output, ensure_ascii=False)
+            )
+        }
+
+        return output, 200
+
+
+# ============================================================
+# MANIFEST VALIDATION
+# ============================================================
+
+def validate_manifest(candidate):
+
+    inventory = candidate.get(
+        "inventory"
+    )
+
+    if not isinstance(inventory, list):
+        return False, None
+
+    canonical_inventory = []
+    names = set()
+
+    for item in inventory:
+
+        if not isinstance(item, dict):
+            return False, None
+
+        # Exact manifest keys.
+        if set(item.keys()) != {
+            "name",
+            "bytes",
+            "sha256"
+        }:
+            return False, None
+
+        name = item.get("name")
+        size = item.get("bytes")
+        digest = item.get("sha256")
+
+        if (
+            not isinstance(name, str)
+            or len(name) == 0
+        ):
+            return False, None
+
+        name_key = utf8(name)
+
+        if name_key in names:
+            return False, None
+
+        names.add(name_key)
+
+        if not safe_integer(size):
+            return False, None
+
+        if (
+            not isinstance(digest, str)
+            or len(digest) != 64
+        ):
+            return False, None
+
+        try:
+            int(digest, 16)
+        except Exception:
+            return False, None
+
+        canonical_inventory.append({
+            "name": name,
+            "bytes": size,
+            "sha256": digest
+        })
+
+    sorted_inventory = sorted(
+        canonical_inventory,
+        key=lambda item: utf8(item["name"])
+    )
+
+    if canonical_inventory != sorted_inventory:
+        return False, None
+
+    total = 0
+
+    for item in canonical_inventory:
+        total += item["bytes"]
+
+        if total > SAFE_MAX:
+            return False, None
+
+    package_digest = sha256(
+        compact_json(canonical_inventory)
+    )
+
+    # Never trust submitted total.
+    if candidate.get("totalBytes") != total:
+        return False, None
+
+    # Never trust submitted package digest.
+    if (
+        candidate.get("packageDigest")
+        != package_digest
+    ):
+        return False, None
+
+    return True, total
+
+
+# ============================================================
+# POLICY VALIDATION
+# ============================================================
+
+def validate_policy(policy):
+
+    if not isinstance(policy, dict):
+        return False
+
+    # --------------------------------------------------------
+    # SIZE
+    # --------------------------------------------------------
+
+    if not safe_integer(
+        policy.get("maxBytes")
+    ):
+        return False
+
+    # --------------------------------------------------------
+    # AGGREGATE FLOOR
+    # --------------------------------------------------------
+
+    aggregate_floor = policy.get(
+        "aggregateFloor"
+    )
+
+    if not finite(aggregate_floor):
+        return False
+
+    if not (
+        0 <= float(aggregate_floor) <= 1
+    ):
+        return False
+
+    # --------------------------------------------------------
+    # REQUIRED SLICES
+    # --------------------------------------------------------
+
+    required = policy.get(
+        "requiredSlices"
+    )
+
+    if not isinstance(required, dict):
+        return False
+
+    for slice_name, floor in required.items():
+
+        if (
+            not isinstance(slice_name, str)
+            or len(slice_name) == 0
+        ):
+            return False
+
+        if not finite(floor):
+            return False
+
+        if not (
+            0 <= float(floor) <= 1
+        ):
+            return False
+
+    # --------------------------------------------------------
+    # LATENCY
+    # --------------------------------------------------------
+
+    max_latency = policy.get(
+        "maxLatencyMs"
+    )
+
+    if not finite(max_latency):
+        return False
+
+    if float(max_latency) < 0:
+        return False
+
+    # --------------------------------------------------------
+    # CANDIDATE ORDER
+    # --------------------------------------------------------
+
+    order = policy.get(
+        "candidateOrder"
+    )
+
+    if not isinstance(order, list):
+        return False
+
+    seen = set()
+
+    for name in order:
+
+        if (
+            not isinstance(name, str)
+            or len(name) == 0
+        ):
+            return False
+
+        key = utf8(name)
+
+        if key in seen:
+            return False
+
+        seen.add(key)
+
+    return True
+
+
+# ============================================================
+# PREDICTION EVALUATION
+# ============================================================
+
+def evaluate_candidate(
+    candidate,
+    rows,
+    required_slices,
+    aggregate_floor,
+    max_bytes,
+    max_latency,
+    latencies
+):
+
+    name = candidate.get(
+        "name",
+        ""
+    )
+
+    codes = []
+
+    # --------------------------------------------------------
+    # FROZEN STATUS
+    # --------------------------------------------------------
+
+    if candidate.get("status") != "frozen":
+        codes.append(
+            "NOT_FROZEN"
+        )
+
+    # --------------------------------------------------------
+    # MANIFEST
+    # --------------------------------------------------------
+
+    manifest_ok, total_bytes = \
+        validate_manifest(candidate)
+
+    if not manifest_ok:
+        codes.append(
+            "INVALID_MANIFEST"
+        )
+        total_out = None
+    else:
+        total_out = total_bytes
+
+    # --------------------------------------------------------
+    # PREDICTIONS
+    # --------------------------------------------------------
+
+    predictions_valid = True
+
+    correct = 0
+
+    slice_total = {}
+    slice_correct = {}
+
+    for row in rows:
+
+        if not isinstance(row, dict):
+            predictions_valid = False
+            continue
+
+        if "label" not in row:
+            predictions_valid = False
+            continue
+
+        if "slice" not in row:
+            predictions_valid = False
+            continue
+
+        label = row["label"]
+        slice_name = row["slice"]
+
+        if not binary(label):
+            predictions_valid = False
+            continue
+
+        if not isinstance(slice_name, str):
+            predictions_valid = False
+            continue
+
+        predictions = row.get(
+            "predictions"
+        )
+
+        if not isinstance(predictions, dict):
+            predictions_valid = False
+            continue
+
+        if name not in predictions:
+            predictions_valid = False
+            continue
+
+        prediction = predictions[name]
+
+        if not binary(prediction):
+            predictions_valid = False
+            continue
+
+        slice_total[slice_name] = (
+            slice_total.get(slice_name, 0) + 1
+        )
+
+        if int(label) == int(prediction):
+
+            correct += 1
+
+            slice_correct[slice_name] = (
+                slice_correct.get(slice_name, 0) + 1
+            )
+
+    # --------------------------------------------------------
+    # INVALID PREDICTIONS
+    # --------------------------------------------------------
+
+    if not predictions_valid:
+
+        aggregate = None
+
+        slices = {
+            name: None
+            for name in required_slices
+        }
+
+        codes.append(
+            "INVALID_PREDICTIONS"
+        )
+
+    else:
+
+        if len(rows) == 0:
+            aggregate = None
+
+            # Empty rows cannot establish required slices.
+            slices = {
+                name: None
+                for name in required_slices
+            }
+
+            for slice_name in required_slices:
+                codes.append(
+                    "MISSING_SLICE:" + slice_name
+                )
+
+            codes.append(
+                "AGGREGATE_FLOOR"
+            )
+
+        else:
+
+            aggregate = round(
+                correct / len(rows),
+                12
+            )
+
+            slices = {}
+
+            # ===============================================
+            # REQUIRED SLICES
+            # ===============================================
+
+            for slice_name, floor in required_slices.items():
+
+                count = slice_total.get(
+                    slice_name,
+                    0
+                )
+
+                if count == 0:
+
+                    slices[slice_name] = None
+
+                    codes.append(
+                        "MISSING_SLICE:" + slice_name
+                    )
+
+                else:
+
+                    value = round(
+                        slice_correct.get(
+                            slice_name,
+                            0
+                        ) / count,
+                        12
+                    )
+
+                    slices[slice_name] = value
+
+                    if value < float(floor):
+                        codes.append(
+                            "SLICE_FLOOR:" + slice_name
+                        )
+
+            # ===============================================
+            # AGGREGATE
+            # ===============================================
+
+            if (
+                aggregate <
+                float(aggregate_floor)
+            ):
+                codes.append(
+                    "AGGREGATE_FLOOR"
+                )
+
+    # --------------------------------------------------------
+    # SIZE
+    # --------------------------------------------------------
+
+    if (
+        manifest_ok
+        and total_bytes > max_bytes
+    ):
+        codes.append(
+            "SIZE_LIMIT"
+        )
+
+    # --------------------------------------------------------
+    # LATENCY
+    # --------------------------------------------------------
+
+    latency = None
+
+    if (
+        isinstance(latencies, dict)
+        and name in latencies
+    ):
+
+        value = latencies[name]
+
+        if (
+            finite(value)
+            and float(value) >= 0
+        ):
+            latency = value
+
+            if (
+                isinstance(latency, float)
+                and latency.is_integer()
+            ):
+                latency = int(latency)
+
+    if latency is None:
+        # Value cannot be validated.
+        # Do NOT add an invented error code.
+        #
+        # Instead, admission is prevented below.
+        pass
+
+    elif (
+        float(latency)
+        > float(max_latency)
+    ):
+        codes.append(
+            "LATENCY_LIMIT"
+        )
+
+    # --------------------------------------------------------
+    # FINAL
+    # --------------------------------------------------------
+
+    reason_codes = sort_codes(codes)
+
+    admitted = (
+        len(reason_codes) == 0
+        and candidate.get("status") == "frozen"
+        and manifest_ok
+        and predictions_valid
+        and aggregate is not None
+        and total_bytes is not None
+        and latency is not None
+    )
+
+    /*
+     * Python comment intentionally below.
+     */
+
+    return {
+        "name": name,
+        "aggregate": aggregate,
+        "slices": slices,
+        "totalBytes": total_out,
+        "latencyMs": latency,
+        "admitted": admitted,
+        "reasonCodes": reason_codes
     }
-  );
 
-server.listen(
-  PORT,
-  "0.0.0.0",
-  () => {
-    console.log(
-      `Quantize admission API listening on ${PORT}`
-    );
-  }
-);
 
-server.on(
-  "error",
-  error => {
-    console.error(
-      "Server error:",
-      error
-    );
-  }
-);
+# ============================================================
+# SELECT
+# ============================================================
+
+def process_select(body):
+
+    freeze_id = body["freezeId"]
+
+    with LOCK:
+        stored = FREEZES.get(freeze_id)
+
+    # ========================================================
+    # NO FROZEN ID
+    # ========================================================
+
+    if stored is None:
+
+        results = []
+
+        for candidate in body["candidates"]:
+
+            if (
+                isinstance(candidate, dict)
+                and isinstance(
+                    candidate.get("name"),
+                    str
+                )
+            ):
+                name = candidate["name"]
+            else:
+                name = ""
+
+            results.append({
+                "name": name,
+                "aggregate": None,
+                "slices": {},
+                "totalBytes": None,
+                "latencyMs": None,
+                "admitted": False,
+                "reasonCodes": [
+                    "NOT_FROZEN"
+                ]
+            })
+
+        results.sort(
+            key=lambda x: utf8(x["name"])
+        )
+
+        return {
+            "freezeId": freeze_id,
+            "selected": None,
+            "results": results,
+            "packageManifest": None
+        }
+
+    # ========================================================
+    # STORED FREEZE
+    # ========================================================
+
+    frozen_candidates = stored[
+        "output"
+    ]["candidates"]
+
+    frozen_names = {
+        candidate["name"]
+        for candidate in frozen_candidates
+    }
+
+    frozen_map = {
+        candidate["name"]: candidate
+        for candidate in frozen_candidates
+    }
+
+    submitted = body["candidates"]
+
+    # EXACT candidate array equality.
+    lineage_ok = (
+        submitted == frozen_candidates
+    )
+
+    policy = body["policy"]
+
+    policy_ok = validate_policy(
+        policy
+    )
+
+    if policy_ok:
+        order = policy["candidateOrder"]
+    else:
+        order = []
+
+    # ========================================================
+    # CANDIDATE NAME SET VS ORDER
+    # ========================================================
+
+    submitted_names = []
+
+    malformed_name = False
+
+    for candidate in submitted:
+
+        if not isinstance(candidate, dict):
+            malformed_name = True
+            continue
+
+        name = candidate.get("name")
+
+        if not isinstance(name, str):
+            malformed_name = True
+            continue
+
+        submitted_names.append(name)
+
+    if policy_ok:
+
+        submitted_set = {
+            utf8(name)
+            for name in submitted_names
+        }
+
+        order_set = {
+            utf8(name)
+            for name in order
+        }
+
+        order_ok = (
+            not malformed_name
+            and len(submitted_names)
+            == len(submitted)
+            and len(order)
+            == len(submitted_names)
+            and len(submitted_set)
+            == len(submitted_names)
+            and submitted_set
+            == order_set
+        )
+
+    else:
+        order_ok = False
+
+    # ========================================================
+    # ROWS
+    # ========================================================
+
+    rows = body["rows"]
+
+    rows_valid = isinstance(rows, list)
+
+    # ========================================================
+    # LATENCIES
+    # ========================================================
+
+    latencies = body.get(
+        "latencies"
+    )
+
+    # ========================================================
+    # RESULTS
+    # ========================================================
+
+    results = []
+
+    for candidate in submitted:
+
+        # ----------------------------------------------------
+        # Completely malformed candidate.
+        # ----------------------------------------------------
+
+        if not isinstance(candidate, dict):
+
+            results.append({
+                "name": "",
+                "aggregate": None,
+                "slices": {},
+                "totalBytes": None,
+                "latencyMs": None,
+                "admitted": False,
+                "reasonCodes": sort_codes([
+                    "INVALID_LINEAGE",
+                    "INVALID_POLICY"
+                ])
+            })
+
+            continue
+
+        # ----------------------------------------------------
+        # Base result
+        # ----------------------------------------------------
+
+        if policy_ok and rows_valid:
+
+            result = evaluate_candidate(
+                candidate,
+                rows,
+                policy["requiredSlices"],
+                policy["aggregateFloor"],
+                policy["maxBytes"],
+                policy["maxLatencyMs"],
+                latencies
+            )
+
+        else:
+
+            result = {
+                "name": candidate.get(
+                    "name",
+                    ""
+                ),
+                "aggregate": None,
+                "slices": (
+                    {
+                        name: None
+                        for name in policy.get(
+                            "requiredSlices",
+                            {}
+                        )
+                    }
+                    if policy_ok
+                    else {}
+                ),
+                "totalBytes": None,
+                "latencyMs": None,
+                "admitted": False,
+                "reasonCodes": []
+            }
+
+            result["reasonCodes"].append(
+                "INVALID_PREDICTIONS"
+            )
+
+        # ----------------------------------------------------
+        # Lineage
+        # ----------------------------------------------------
+
+        if not lineage_ok:
+            result["reasonCodes"].append(
+                "INVALID_LINEAGE"
+            )
+
+        # ----------------------------------------------------
+        # Policy
+        # ----------------------------------------------------
+
+        if not policy_ok or not order_ok:
+            result["reasonCodes"].append(
+                "INVALID_POLICY"
+            )
+
+        # ----------------------------------------------------
+        # Finalize
+        # ----------------------------------------------------
+
+        result["reasonCodes"] = sort_codes(
+            result["reasonCodes"]
+        )
+
+        result["admitted"] = (
+            len(result["reasonCodes"]) == 0
+        )
+
+        results.append(result)
+
+    # ========================================================
+    # RESULT ORDER
+    # ========================================================
+
+    if policy_ok:
+
+        rank = {
+            name: index
+            for index, name in enumerate(order)
+        }
+
+        results.sort(
+            key=lambda result: (
+                rank.get(
+                    result["name"],
+                    999999999
+                ),
+                utf8(result["name"])
+            )
+        )
+
+    else:
+
+        results.sort(
+            key=lambda result:
+            utf8(result["name"])
+        )
+
+    # ========================================================
+    # WINNER
+    # ========================================================
+
+    eligible = [
+        result
+        for result in results
+        if result["admitted"]
+    ]
+
+    selected = None
+    package_manifest = None
+
+    if (
+        eligible
+        and lineage_ok
+        and policy_ok
+        and order_ok
+    ):
+
+        rank = {
+            name: index
+            for index, name in enumerate(order)
+        }
+
+        winner = min(
+            eligible,
+            key=lambda result: (
+                result["totalBytes"],
+                result["latencyMs"],
+                rank.get(
+                    result["name"],
+                    999999999
+                ),
+                utf8(result["name"])
+            )
+        )
+
+        selected = winner["name"]
+
+        # EXACT recorded winner object.
+        package_manifest = frozen_map[
+            selected
+        ]
+
+    return {
+        "freezeId": freeze_id,
+        "selected": selected,
+        "results": results,
+        "packageManifest": package_manifest
+    }
+
+
+# ============================================================
+# POST /quantize
+# ============================================================
+
+@app.post("/quantize")
+async def quantize(request: Request):
+
+    try:
+        body = await request.json()
+
+    except Exception:
+        return JSONResponse(
+            {
+                "error": "INVALID_INPUT"
+            },
+            status_code=400
+        )
+
+    if not isinstance(body, dict):
+        return JSONResponse(
+            {
+                "error": "INVALID_INPUT"
+            },
+            status_code=400
+        )
+
+    phase = body.get("phase")
+
+    # ========================================================
+    # FREEZE
+    # ========================================================
+
+    if phase == "freeze":
+
+        if not valid_freeze(body):
+
+            return JSONResponse(
+                {
+                    "error": "INVALID_INPUT"
+                },
+                status_code=400
+            )
+
+        response, status = process_freeze(
+            body
+        )
+
+        return JSONResponse(
+            response,
+            status_code=status
+        )
+
+    # ========================================================
+    # SELECT
+    # ========================================================
+
+    if phase == "select":
+
+        /*
+         * Assignment explicitly says:
+         * candidates + rows must be arrays
+         * policy must be an object.
+         */
+
+        if not isinstance(
+            body.get("candidates"),
+            list
+        ):
+            return JSONResponse(
+                {
+                    "error": "INVALID_INPUT"
+                },
+                status_code=400
+            )
+
+        if not isinstance(
+            body.get("rows"),
+            list
+        ):
+            return JSONResponse(
+                {
+                    "error": "INVALID_INPUT"
+                },
+                status_code=400
+            )
+
+        if not isinstance(
+            body.get("policy"),
+            dict
+        ):
+            return JSONResponse(
+                {
+                    "error": "INVALID_INPUT"
+                },
+                status_code=400
+            )
+
+        if not isinstance(
+            body.get("freezeId"),
+            str
+        ):
+            return JSONResponse(
+                {
+                    "error": "INVALID_INPUT"
+                },
+                status_code=400
+            )
+
+        # IMPORTANT:
+        # process_select() returns the actual response body,
+        # NOT {status, body}.
+        response = process_select(
+            body
+        )
+
+        return JSONResponse(
+            response,
+            status_code=200
+        )
+
+    # ========================================================
+    # UNKNOWN / MISSING PHASE
+    # ========================================================
+
+    return JSONResponse(
+        {
+            "error": "INVALID_INPUT"
+        },
+        status_code=400
+    )
+
+
+# ============================================================
+# HEALTH
+# ============================================================
+
+@app.get("/")
+def root():
+    return {
+        "service": "quantize",
+        "status": "ok"
+    }
+
+
+@app.get("/health")
+def health():
+    return {
+        "status": "ok"
+    }
