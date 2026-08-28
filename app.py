@@ -569,10 +569,7 @@ def do_select(body):
     stored = FREEZES.get(freeze_id)
 
     if stored is None:
-        return error_response(
-            "NOT_FROZEN",
-            400,
-        )
+        return error_response("INVALID_INPUT", 400)
 
     submitted_candidates = body["candidates"]
 
@@ -581,12 +578,12 @@ def do_select(body):
         stored["response"]["candidates"],
         submitted_candidates,
     ):
-        return error_response("INVALID_LINEAGE", 400)
+        return error_response("INVALID_INPUT", 400)
 
     policy = body["policy"]
 
     if not validate_policy(policy):
-        return error_response("INVALID_POLICY", 400)
+        return error_response("INVALID_INPUT", 400)
 
     candidate_order = policy["candidateOrder"]
 
@@ -606,12 +603,12 @@ def do_select(body):
         or set(stored_names) != set(submitted_names)
         or set(stored_names) != set(candidate_order)
     ):
-        return error_response("INVALID_POLICY", 400)
+        return error_response("INVALID_INPUT", 400)
 
     latencies = body["latencies"]
 
     if not isinstance(latencies, dict):
-        return error_response("INVALID_POLICY", 400)
+        return error_response("INVALID_INPUT", 400)
 
     rows = body["rows"]
 
@@ -796,18 +793,20 @@ async def quantize(request: Request):
         return do_freeze(body)
 
     # ---------------- SELECT ----------------
-    # Required top-level fields.
+    # Required top-level fields with empty array checks.
+    candidates = body.get("candidates")
+    rows = body.get("rows")
+    policy = body.get("policy")
+
     if (
-        not isinstance(body.get("candidates"), list)
-        or not isinstance(body.get("rows"), list)
-        or not isinstance(body.get("policy"), dict)
+        not isinstance(candidates, list) 
+        or len(candidates) == 0  # Empty candidates array is invalid
+        or not isinstance(rows, list) 
+        or len(rows) == 0  # Empty rows array is invalid
+        or not isinstance(policy, dict)
+        or "freezeId" not in body
+        or "latencies" not in body
     ):
-        return error_response("INVALID_INPUT", 400)
-
-    if "freezeId" not in body:
-        return error_response("INVALID_INPUT", 400)
-
-    if "latencies" not in body:
         return error_response("INVALID_INPUT", 400)
 
     return do_select(body)
