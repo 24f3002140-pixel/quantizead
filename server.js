@@ -6,49 +6,78 @@ app.use(express.json({ limit: "50mb" }));
 
 const freezes = new Map();
 
-const isObj = x =>
-  x !== null && typeof x === "object" && !Array.isArray(x);
+function isObj(x) {
+  return x !== null && typeof x === "object" && !Array.isArray(x);
+}
 
-const str = x => typeof x === "string" && x.length > 0;
+function nonEmptyString(x) {
+  return typeof x === "string" && x.length > 0;
+}
 
-const utf8cmp = (a, b) =>
-  Buffer.compare(Buffer.from(a, "utf8"), Buffer.from(b, "utf8"));
+function utf8Compare(a, b) {
+  return Buffer.compare(Buffer.from(a, "utf8"), Buffer.from(b, "utf8"));
+}
 
-const sha256 = x =>
-  crypto.createHash("sha256").update(x).digest("hex");
+function sha256(value) {
+  return crypto.createHash("sha256").update(value).digest("hex");
+}
 
-const invalid = res =>
-  res.status(400).json({ error: "INVALID_INPUT" });
+function invalid(res) {
+  return res.status(400).json({ error: "INVALID_INPUT" });
+}
 
-const codes = xs => [...new Set(xs)].sort(utf8cmp);
+function sortedUniqueCodes(list) {
+  return [...new Set(list)].sort(utf8Compare);
+}
 
-const finiteNN = x =>
-  typeof x === "number" && Number.isFinite(x) && x >= 0;
+function finiteNonNegative(x) {
+  return (
+    typeof x === "number" &&
+    Number.isFinite(x) &&
+    x >= 0
+  );
+}
 
-const safeNNInt = x =>
-  typeof x === "number" &&
-  Number.isSafeInteger(x) &&
-  x >= 0;
+function safeNonNegativeInteger(x) {
+  return (
+    typeof x === "number" &&
+    Number.isSafeInteger(x) &&
+    x >= 0
+  );
+}
 
-const floor = x =>
-  typeof x === "number" &&
-  Number.isFinite(x) &&
-  x >= 0 &&
-  x <= 1;
+function validFloor(x) {
+  return (
+    typeof x === "number" &&
+    Number.isFinite(x) &&
+    x >= 0 &&
+    x <= 1
+  );
+}
 
-const binary = x =>
-  typeof x === "number" && (x === 0 || x === 1);
+function binaryPrediction(x) {
+  return typeof x === "number" && (x === 0 || x === 1);
+}
 
-function equal(a, b) {
+/*
+ * Deep equality.
+ * Object key order does not matter.
+ * Array order DOES matter.
+ */
+function deepEqual(a, b) {
   if (a === b) return true;
+
   if (typeof a !== typeof b) return false;
   if (a === null || b === null) return false;
 
   if (Array.isArray(a)) {
-    if (!Array.isArray(b) || a.length !== b.length) return false;
+    if (!Array.isArray(b)) return false;
+    if (a.length !== b.length) return false;
+
     for (let i = 0; i < a.length; i++) {
-      if (!equal(a[i], b[i])) return false;
+      if (!deepEqual(a[i], b[i])) return false;
     }
+
     return true;
   }
 
@@ -62,7 +91,10 @@ function equal(a, b) {
 
     for (let i = 0; i < ak.length; i++) {
       if (ak[i] !== bk[i]) return false;
-      if (!equal(a[ak[i]], b[bk[i]])) return false;
+
+      if (!deepEqual(a[ak[i]], b[bk[i]])) {
+        return false;
+      }
     }
 
     return true;
@@ -71,109 +103,136 @@ function equal(a, b) {
   return false;
 }
 
-function inventory(files) {
-  if (!isObj(files) || Object.keys(files).length === 0)
-    return null;
+/*
+ * Build the artifact inventory.
+ */
+function buildInventory(files) {
+  if (!isObj(files)) return null;
 
   const names = Object.keys(files);
 
-  for (const n of names) {
-    if (!str(n) || typeof files[n] !== "string")
-      return null;
-  }
-
-  names.sort(utf8cmp);
-
-  const inv = [];
-  let total = 0;
+  if (names.length === 0) return null;
 
   for (const name of names) {
-    const buf = Buffer.from(files[name], "utf8");
+    if (!nonEmptyString(name)) return null;
 
-    inv.push({
-      name,
-      bytes: buf.length,
-      sha256: sha256(buf)
-    });
-
-    total += buf.length;
+    if (typeof files[name] !== "string") {
+      return null;
+    }
   }
 
+  names.sort(utf8Compare);
+
+  const inventory = [];
+  let totalBytes = 0;
+
+  for (const name of names) {
+    const bytes = Buffer.from(files[name], "utf8");
+
+    inventory.push({
+      name: name,
+      bytes: bytes.length,
+      sha256: sha256(bytes)
+    });
+
+    totalBytes += bytes.length;
+  }
+
+  /*
+   * IMPORTANT:
+   * JSON.stringify preserves:
+   * name, bytes, sha256
+   * in exactly that order.
+   */
   const packageDigest = sha256(
-    Buffer.from(JSON.stringify(inv), "utf8")
+    Buffer.from(JSON.stringify(inventory), "utf8")
   );
 
   return {
-    inventory: inv,
-    totalBytes: total,
+    inventory,
+    totalBytes,
     packageDigest
   };
 }
 
-/* ============================================================
-   FREEZE
-   ============================================================ */
-
-function validFreezeTop(body) {
+/*
+ * Validate the global freeze request.
+ */
+function validFreezeRequest(body) {
   if (!isObj(body)) return false;
+
   if (body.phase !== "freeze") return false;
 
-  if (!str(body.freezeId) || body.freezeId.length > 128)
+  if (
+    !nonEmptyString(body.freezeId) ||
+    body.freezeId.length > 128
+  ) {
     return false;
+  }
 
-  if (!str(body.calibrationDigest))
+  if (!nonEmptyString(body.calibrationDigest)) {
     return false;
+  }
 
-  if (!str(body.tokenizerDigest))
+  if (!nonEmptyString(body.tokenizerDigest)) {
     return false;
+  }
 
-  if (!Array.isArray(body.allowedUnsupportedReasons))
+  if (!Array.isArray(body.allowedUnsupportedReasons)) {
     return false;
+  }
 
   const reasons = new Set();
 
-  for (const r of body.allowedUnsupportedReasons) {
-    if (!str(r) || reasons.has(r))
-      return false;
+  for (const reason of body.allowedUnsupportedReasons) {
+    if (!nonEmptyString(reason)) return false;
 
-    reasons.add(r);
+    if (reasons.has(reason)) return false;
+
+    reasons.add(reason);
   }
 
   /*
-   * The assignment explicitly says:
-   * empty/non-array freeze candidates => HTTP 400
+   * This is explicitly required by the question.
    */
-  if (!Array.isArray(body.candidates) ||
-      body.candidates.length === 0)
+  if (
+    !Array.isArray(body.candidates) ||
+    body.candidates.length === 0
+  ) {
     return false;
+  }
 
   const names = new Set();
 
-  for (const c of body.candidates) {
-    if (!isObj(c))
-      return false;
+  for (const candidate of body.candidates) {
+    if (!isObj(candidate)) return false;
 
-    if (!str(c.name) || names.has(c.name))
+    if (!nonEmptyString(candidate.name)) {
       return false;
+    }
 
-    names.add(c.name);
+    if (names.has(candidate.name)) {
+      return false;
+    }
+
+    names.add(candidate.name);
   }
 
   return true;
 }
 
-function makeFreezeCandidate(c, body) {
-  const reasonCodes = [];
+/*
+ * Freeze one candidate.
+ */
+function freezeCandidate(candidate, request) {
+  const inventory = buildInventory(candidate.files);
 
   /*
-   * Bad files invalidate ONLY this candidate.
-   * They do not invalidate the entire freeze request.
+   * Invalid files invalidate the candidate only.
    */
-  const inv = inventory(c.files);
-
-  if (!inv) {
+  if (!inventory) {
     return {
-      name: c.name,
+      name: candidate.name,
       status: "invalid",
       inventory: [],
       totalBytes: null,
@@ -183,12 +242,17 @@ function makeFreezeCandidate(c, body) {
   }
 
   /*
-   * unsupportedReason takes precedence.
+   * unsupportedReason has precedence.
    */
-  if (Object.prototype.hasOwnProperty.call(c, "unsupportedReason")) {
-    if (!str(c.unsupportedReason)) {
+  if (
+    Object.prototype.hasOwnProperty.call(
+      candidate,
+      "unsupportedReason"
+    )
+  ) {
+    if (!nonEmptyString(candidate.unsupportedReason)) {
       return {
-        name: c.name,
+        name: candidate.name,
         status: "invalid",
         inventory: [],
         totalBytes: null,
@@ -197,86 +261,112 @@ function makeFreezeCandidate(c, body) {
       };
     }
 
-    if (body.allowedUnsupportedReasons.includes(c.unsupportedReason)) {
+    if (
+      request.allowedUnsupportedReasons.includes(
+        candidate.unsupportedReason
+      )
+    ) {
       return {
-        name: c.name,
+        name: candidate.name,
         status: "unsupported",
-        inventory: inv.inventory,
-        totalBytes: inv.totalBytes,
-        packageDigest: inv.packageDigest,
+        inventory: inventory.inventory,
+        totalBytes: inventory.totalBytes,
+        packageDigest: inventory.packageDigest,
         reasonCodes: []
       };
     }
 
     return {
-      name: c.name,
+      name: candidate.name,
       status: "invalid",
-      inventory: inv.inventory,
-      totalBytes: inv.totalBytes,
-      packageDigest: inv.packageDigest,
-      reasonCodes: ["UNALLOWED_UNSUPPORTED_REASON"]
+      inventory: inventory.inventory,
+      totalBytes: inventory.totalBytes,
+      packageDigest: inventory.packageDigest,
+      reasonCodes: [
+        "UNALLOWED_UNSUPPORTED_REASON"
+      ]
     };
   }
 
-  /*
-   * Normal candidate.
-   */
-  if (c.loadable !== true)
-    reasonCodes.push("NOT_LOADABLE");
+  const reasons = [];
 
-  if (!str(c.calibrationDigest))
-    reasonCodes.push("CALIBRATION_MISMATCH");
-  else if (c.calibrationDigest !== body.calibrationDigest)
-    reasonCodes.push("CALIBRATION_MISMATCH");
+  if (candidate.loadable !== true) {
+    reasons.push("NOT_LOADABLE");
+  }
 
-  if (!str(c.tokenizerDigest))
-    reasonCodes.push("TOKENIZER_MISMATCH");
-  else if (c.tokenizerDigest !== body.tokenizerDigest)
-    reasonCodes.push("TOKENIZER_MISMATCH");
+  if (
+    typeof candidate.calibrationDigest !== "string" ||
+    candidate.calibrationDigest.length === 0 ||
+    candidate.calibrationDigest !==
+      request.calibrationDigest
+  ) {
+    reasons.push("CALIBRATION_MISMATCH");
+  }
 
-  if (reasonCodes.length > 0) {
+  if (
+    typeof candidate.tokenizerDigest !== "string" ||
+    candidate.tokenizerDigest.length === 0 ||
+    candidate.tokenizerDigest !==
+      request.tokenizerDigest
+  ) {
+    reasons.push("TOKENIZER_MISMATCH");
+  }
+
+  if (reasons.length > 0) {
     return {
-      name: c.name,
+      name: candidate.name,
       status: "invalid",
-      inventory: inv.inventory,
-      totalBytes: inv.totalBytes,
-      packageDigest: inv.packageDigest,
-      reasonCodes: codes(reasonCodes)
+      inventory: inventory.inventory,
+      totalBytes: inventory.totalBytes,
+      packageDigest: inventory.packageDigest,
+      reasonCodes: sortedUniqueCodes(reasons)
     };
   }
 
   return {
-    name: c.name,
+    name: candidate.name,
     status: "frozen",
-    inventory: inv.inventory,
-    totalBytes: inv.totalBytes,
-    packageDigest: inv.packageDigest,
+    inventory: inventory.inventory,
+    totalBytes: inventory.totalBytes,
+    packageDigest: inventory.packageDigest,
     reasonCodes: []
   };
 }
 
+/*
+ * FREEZE
+ */
 function freeze(body, res) {
-  if (!validFreezeTop(body))
+  if (!validFreezeRequest(body)) {
     return invalid(res);
+  }
 
   const old = freezes.get(body.freezeId);
 
+  /*
+   * Same freezeId + same request = exact replay.
+   */
   if (old) {
-    if (equal(old.input, body))
+    if (deepEqual(old.input, body)) {
       return res.status(200).json(old.response);
+    }
 
     return res.status(409).json({
       error: "FREEZE_ID_CONFLICT"
     });
   }
 
-  const result = body.candidates
-    .map(c => makeFreezeCandidate(c, body))
-    .sort((a, b) => utf8cmp(a.name, b.name));
+  const candidates = body.candidates
+    .map(candidate =>
+      freezeCandidate(candidate, body)
+    )
+    .sort((a, b) =>
+      utf8Compare(a.name, b.name)
+    );
 
   const response = {
     freezeId: body.freezeId,
-    candidates: result
+    candidates
   };
 
   freezes.set(body.freezeId, {
@@ -287,148 +377,226 @@ function freeze(body, res) {
   return res.status(200).json(response);
 }
 
-/* ============================================================
-   SELECT
-   ============================================================ */
-
+/*
+ * Validate SELECT top-level structure.
+ */
 function validSelectTop(body) {
   return (
     isObj(body) &&
+    body.phase === "select" &&
+    nonEmptyString(body.freezeId) &&
     Array.isArray(body.candidates) &&
     Array.isArray(body.rows) &&
-    isObj(body.policy)
+    isObj(body.policy) &&
+    isObj(body.latencies)
   );
 }
 
-function validPolicy(policy, names) {
-  if (!safeNNInt(policy.maxBytes))
+/*
+ * Validate policy.
+ */
+function validPolicy(policy, candidateNames) {
+  if (!isObj(policy)) return false;
+
+  if (!safeNonNegativeInteger(policy.maxBytes)) {
     return false;
-
-  if (!floor(policy.aggregateFloor))
-    return false;
-
-  if (!isObj(policy.requiredSlices))
-    return false;
-
-  for (const s of Object.keys(policy.requiredSlices)) {
-    if (!str(s))
-      return false;
-
-    if (!floor(policy.requiredSlices[s]))
-      return false;
   }
 
-  if (!finiteNN(policy.maxLatencyMs))
+  if (!validFloor(policy.aggregateFloor)) {
     return false;
+  }
 
-  if (!Array.isArray(policy.candidateOrder))
+  if (!isObj(policy.requiredSlices)) {
     return false;
+  }
+
+  const sliceNames = Object.keys(
+    policy.requiredSlices
+  );
+
+  const seenSlices = new Set();
+
+  for (const slice of sliceNames) {
+    if (!nonEmptyString(slice)) {
+      return false;
+    }
+
+    if (seenSlices.has(slice)) {
+      return false;
+    }
+
+    seenSlices.add(slice);
+
+    if (!validFloor(policy.requiredSlices[slice])) {
+      return false;
+    }
+  }
+
+  if (!finiteNonNegative(policy.maxLatencyMs)) {
+    return false;
+  }
+
+  if (!Array.isArray(policy.candidateOrder)) {
+    return false;
+  }
 
   const order = new Set();
 
-  for (const n of policy.candidateOrder) {
-    if (!str(n) || order.has(n))
+  for (const name of policy.candidateOrder) {
+    if (!nonEmptyString(name)) {
       return false;
+    }
 
-    order.add(n);
+    if (order.has(name)) {
+      return false;
+    }
+
+    order.add(name);
   }
 
-  if (order.size !== names.size)
+  /*
+   * Exactly the same unique candidate set.
+   */
+  if (order.size !== candidateNames.size) {
     return false;
+  }
 
-  for (const n of names) {
-    if (!order.has(n))
+  for (const name of candidateNames) {
+    if (!order.has(name)) {
       return false;
+    }
   }
 
   return true;
 }
 
-function checkManifest(c) {
-  if (!isObj(c))
-    return null;
+/*
+ * Validate and recompute manifest.
+ */
+function validateManifest(candidate) {
+  if (!isObj(candidate)) return null;
 
-  if (!Array.isArray(c.inventory))
+  if (!Array.isArray(candidate.inventory)) {
     return null;
+  }
 
   const seen = new Set();
 
-  for (const x of c.inventory) {
-    if (!isObj(x))
+  for (const item of candidate.inventory) {
+    if (!isObj(item)) return null;
+
+    /*
+     * Exact keys:
+     * name, bytes, sha256
+     */
+    const keys = Object.keys(item);
+
+    if (keys.length !== 3) {
       return null;
+    }
 
     if (
-      Object.keys(x).length !== 3 ||
-      !str(x.name) ||
-      !safeNNInt(x.bytes) ||
-      typeof x.sha256 !== "string" ||
-      !/^[0-9a-f]{64}$/.test(x.sha256)
+      !nonEmptyString(item.name) ||
+      !safeNonNegativeInteger(item.bytes) ||
+      typeof item.sha256 !== "string" ||
+      !/^[0-9a-f]{64}$/.test(item.sha256)
     ) {
       return null;
     }
 
-    if (seen.has(x.name))
+    if (seen.has(item.name)) {
       return null;
+    }
 
-    seen.add(x.name);
+    seen.add(item.name);
   }
 
-  const sorted = [...c.inventory].sort((a, b) =>
-    utf8cmp(a.name, b.name)
+  /*
+   * Inventory must already be UTF-8 sorted.
+   */
+  const sorted = [...candidate.inventory].sort(
+    (a, b) => utf8Compare(a.name, b.name)
   );
 
-  if (!equal(sorted, c.inventory))
+  if (!deepEqual(sorted, candidate.inventory)) {
     return null;
+  }
 
-  const total = c.inventory.reduce(
-    (a, x) => a + x.bytes,
-    0
+  const totalBytes =
+    candidate.inventory.reduce(
+      (sum, item) => sum + item.bytes,
+      0
+    );
+
+  if (candidate.totalBytes !== totalBytes) {
+    return null;
+  }
+
+  const packageDigest = sha256(
+    Buffer.from(
+      JSON.stringify(candidate.inventory),
+      "utf8"
+    )
   );
 
-  if (c.totalBytes !== total)
+  if (
+    candidate.packageDigest !== packageDigest
+  ) {
     return null;
-
-  const digest = sha256(
-    Buffer.from(JSON.stringify(c.inventory), "utf8")
-  );
-
-  if (c.packageDigest !== digest)
-    return null;
+  }
 
   return {
-    totalBytes: total,
-    packageDigest: digest
+    totalBytes,
+    packageDigest
   };
 }
 
-function evaluate(name, rows, requiredSlices) {
+/*
+ * Evaluate predictions.
+ */
+function evaluateCandidate(
+  name,
+  rows,
+  requiredSlices
+) {
   if (rows.length === 0) {
-    const s = {};
-    for (const x of Object.keys(requiredSlices))
-      s[x] = null;
+    const slices = {};
+
+    for (const slice of Object.keys(requiredSlices)) {
+      slices[slice] = null;
+    }
 
     return {
       valid: false,
       aggregate: null,
-      slices: s
+      slices
     };
   }
 
   for (const row of rows) {
-    if (!isObj(row))
-      return badEvaluation(requiredSlices);
+    if (!isObj(row)) {
+      return invalidEvaluation(requiredSlices);
+    }
 
-    if (!binary(row.label))
-      return badEvaluation(requiredSlices);
+    if (!binaryPrediction(row.label)) {
+      return invalidEvaluation(requiredSlices);
+    }
 
-    if (!str(row.slice))
-      return badEvaluation(requiredSlices);
+    if (!nonEmptyString(row.slice)) {
+      return invalidEvaluation(requiredSlices);
+    }
 
-    if (!isObj(row.predictions))
-      return badEvaluation(requiredSlices);
+    if (!isObj(row.predictions)) {
+      return invalidEvaluation(requiredSlices);
+    }
 
-    if (!binary(row.predictions[name]))
-      return badEvaluation(requiredSlices);
+    if (
+      !binaryPrediction(
+        row.predictions[name]
+      )
+    ) {
+      return invalidEvaluation(requiredSlices);
+    }
   }
 
   let correct = 0;
@@ -437,36 +605,40 @@ function evaluate(name, rows, requiredSlices) {
   const correctBySlice = {};
 
   for (const row of rows) {
-    const p = row.predictions[name];
+    const prediction =
+      row.predictions[name];
 
-    if (p === row.label)
+    if (prediction === row.label) {
       correct++;
+    }
 
     totalBySlice[row.slice] =
       (totalBySlice[row.slice] || 0) + 1;
 
-    if (p === row.label) {
+    if (prediction === row.label) {
       correctBySlice[row.slice] =
         (correctBySlice[row.slice] || 0) + 1;
     }
   }
 
-  const aggregate =
-    Number((correct / rows.length).toFixed(12));
+  const aggregate = Number(
+    (correct / rows.length).toFixed(12)
+  );
 
   const slices = {};
 
-  for (const s of Object.keys(requiredSlices)) {
-    if (!(s in totalBySlice)) {
-      slices[s] = null;
+  for (const slice of Object.keys(
+    requiredSlices
+  )) {
+    if (!(slice in totalBySlice)) {
+      slices[slice] = null;
     } else {
-      slices[s] =
-        Number(
-          (
-            correctBySlice[s] /
-            totalBySlice[s]
-          ).toFixed(12)
-        );
+      slices[slice] = Number(
+        (
+          correctBySlice[slice] /
+          totalBySlice[slice]
+        ).toFixed(12)
+      );
     }
   }
 
@@ -477,11 +649,14 @@ function evaluate(name, rows, requiredSlices) {
   };
 }
 
-function badEvaluation(requiredSlices) {
+function invalidEvaluation(requiredSlices) {
   const slices = {};
 
-  for (const s of Object.keys(requiredSlices))
-    slices[s] = null;
+  for (const slice of Object.keys(
+    requiredSlices
+  )) {
+    slices[slice] = null;
+  }
 
   return {
     valid: false,
@@ -490,9 +665,13 @@ function badEvaluation(requiredSlices) {
   };
 }
 
+/*
+ * SELECT
+ */
 function select(body, res) {
-  if (!validSelectTop(body))
+  if (!validSelectTop(body)) {
     return invalid(res);
+  }
 
   const submitted = body.candidates;
   const rows = body.rows;
@@ -500,112 +679,184 @@ function select(body, res) {
 
   const stored = freezes.get(body.freezeId);
 
+  /*
+   * Candidate names must be unique.
+   */
   const names = new Set();
   let namesValid = true;
 
-  for (const c of submitted) {
-    if (!isObj(c) || !str(c.name) || names.has(c.name)) {
+  for (const candidate of submitted) {
+    if (
+      !isObj(candidate) ||
+      !nonEmptyString(candidate.name) ||
+      names.has(candidate.name)
+    ) {
       namesValid = false;
       continue;
     }
 
-    names.add(c.name);
+    names.add(candidate.name);
   }
 
-  const pValid =
+  const policyValid =
     namesValid &&
     validPolicy(policy, names);
 
+  /*
+   * Exact frozen candidate array.
+   */
   const exactLineage =
     !!stored &&
-    equal(stored.response.candidates, submitted);
+    deepEqual(
+      stored.response.candidates,
+      submitted
+    );
 
   const storedByName = new Map();
 
   if (stored) {
-    for (const c of stored.response.candidates)
-      storedByName.set(c.name, c);
+    for (const candidate of
+      stored.response.candidates) {
+      storedByName.set(
+        candidate.name,
+        candidate
+      );
+    }
   }
 
   const results = [];
 
-  for (const c of submitted) {
+  for (const candidate of submitted) {
     const name =
-      isObj(c) && typeof c.name === "string"
-        ? c.name
+      isObj(candidate) &&
+      typeof candidate.name === "string"
+        ? candidate.name
         : "";
 
     const reasonCodes = [];
 
-    if (!stored)
+    if (!stored) {
       reasonCodes.push("NOT_FROZEN");
+    }
 
-    if (!exactLineage)
+    if (!exactLineage) {
       reasonCodes.push("INVALID_LINEAGE");
+    }
 
-    if (!pValid)
+    if (!policyValid) {
       reasonCodes.push("INVALID_POLICY");
+    }
 
-    const manifest = checkManifest(c);
+    /*
+     * Recompute manifest.
+     */
+    const manifest =
+      validateManifest(candidate);
 
     let totalBytes = null;
 
     if (!manifest) {
-      reasonCodes.push("INVALID_MANIFEST");
+      reasonCodes.push(
+        "INVALID_MANIFEST"
+      );
     } else {
-      totalBytes = manifest.totalBytes;
+      totalBytes =
+        manifest.totalBytes;
     }
 
-    const ev = evaluate(
-      name,
-      rows,
-      pValid ? policy.requiredSlices : {}
-    );
+    /*
+     * Predictions.
+     */
+    const evaluation =
+      evaluateCandidate(
+        name,
+        rows,
+        policyValid
+          ? policy.requiredSlices
+          : {}
+      );
 
-    if (!ev.valid) {
-      reasonCodes.push("INVALID_PREDICTIONS");
-    } else if (pValid) {
-      if (ev.aggregate < policy.aggregateFloor)
-        reasonCodes.push("AGGREGATE_FLOOR");
+    if (!evaluation.valid) {
+      reasonCodes.push(
+        "INVALID_PREDICTIONS"
+      );
+    } else if (policyValid) {
+      if (
+        evaluation.aggregate <
+        policy.aggregateFloor
+      ) {
+        reasonCodes.push(
+          "AGGREGATE_FLOOR"
+        );
+      }
 
-      for (const s of Object.keys(policy.requiredSlices)) {
-        if (ev.slices[s] === null)
-          reasonCodes.push(`MISSING_SLICE:${s}`);
-        else if (
-          ev.slices[s] <
-          policy.requiredSlices[s]
-        )
-          reasonCodes.push(`SLICE_FLOOR:${s}`);
+      for (const slice of Object.keys(
+        policy.requiredSlices
+      )) {
+        if (
+          evaluation.slices[slice] === null
+        ) {
+          reasonCodes.push(
+            `MISSING_SLICE:${slice}`
+          );
+        } else if (
+          evaluation.slices[slice] <
+          policy.requiredSlices[slice]
+        ) {
+          reasonCodes.push(
+            `SLICE_FLOOR:${slice}`
+          );
+        }
       }
     }
 
+    /*
+     * Latency.
+     */
     let latencyMs = null;
 
     if (
-      isObj(body.latencies) &&
-      finiteNN(body.latencies[name])
+      finiteNonNegative(
+        body.latencies[name]
+      )
     ) {
-      latencyMs = body.latencies[name];
+      latencyMs =
+        body.latencies[name];
     } else {
-      reasonCodes.push("LATENCY_LIMIT");
+      reasonCodes.push(
+        "LATENCY_LIMIT"
+      );
     }
 
+    /*
+     * Size.
+     */
     if (
-      pValid &&
+      policyValid &&
       totalBytes !== null &&
       totalBytes > policy.maxBytes
     ) {
-      reasonCodes.push("SIZE_LIMIT");
+      reasonCodes.push(
+        "SIZE_LIMIT"
+      );
     }
 
+    /*
+     * Latency limit.
+     */
     if (
-      pValid &&
+      policyValid &&
       latencyMs !== null &&
       latencyMs > policy.maxLatencyMs
     ) {
-      reasonCodes.push("LATENCY_LIMIT");
+      reasonCodes.push(
+        "LATENCY_LIMIT"
+      );
     }
 
+    /*
+     * Candidate must actually be frozen.
+     */
     const storedCandidate =
       storedByName.get(name);
 
@@ -613,49 +864,57 @@ function select(body, res) {
       !storedCandidate ||
       storedCandidate.status !== "frozen"
     ) {
-      reasonCodes.push("NOT_FROZEN");
+      reasonCodes.push(
+        "NOT_FROZEN"
+      );
     }
 
-    const finalCodes = codes(reasonCodes);
+    const finalCodes =
+      sortedUniqueCodes(reasonCodes);
 
     results.push({
       name,
-      aggregate: ev.aggregate,
-      slices: ev.slices,
+      aggregate:
+        evaluation.aggregate,
+      slices:
+        evaluation.slices,
       totalBytes,
       latencyMs,
-      admitted: finalCodes.length === 0,
+      admitted:
+        finalCodes.length === 0,
       reasonCodes: finalCodes
     });
   }
 
   /*
-   * Result order:
-   * candidateOrder first,
-   * UTF-8 name fallback.
+   * Results in candidateOrder.
+   * UTF-8 name is fallback.
    */
   const order =
-    pValid
+    policyValid
       ? policy.candidateOrder
       : [];
 
-  const pos = new Map(
-    order.map((n, i) => [n, i])
-  );
+  const positions = new Map();
+
+  order.forEach((name, index) => {
+    positions.set(name, index);
+  });
 
   results.sort((a, b) => {
-    const ai = pos.has(a.name)
-      ? pos.get(a.name)
+    const ai = positions.has(a.name)
+      ? positions.get(a.name)
       : Number.MAX_SAFE_INTEGER;
 
-    const bi = pos.has(b.name)
-      ? pos.get(b.name)
+    const bi = positions.has(b.name)
+      ? positions.get(b.name)
       : Number.MAX_SAFE_INTEGER;
 
-    if (ai !== bi)
+    if (ai !== bi) {
       return ai - bi;
+    }
 
-    return utf8cmp(a.name, b.name);
+    return utf8Compare(a.name, b.name);
   });
 
   /*
@@ -666,37 +925,61 @@ function select(body, res) {
    * 4. UTF-8 name
    */
   const admitted =
-    results.filter(x => x.admitted);
+    results.filter(
+      result => result.admitted
+    );
 
   let selected = null;
   let packageManifest = null;
 
   if (admitted.length > 0) {
     admitted.sort((a, b) => {
-      if (a.totalBytes !== b.totalBytes)
-        return a.totalBytes - b.totalBytes;
+      if (
+        a.totalBytes !==
+        b.totalBytes
+      ) {
+        return (
+          a.totalBytes -
+          b.totalBytes
+        );
+      }
 
-      if (a.latencyMs !== b.latencyMs)
-        return a.latencyMs - b.latencyMs;
+      if (
+        a.latencyMs !==
+        b.latencyMs
+      ) {
+        return (
+          a.latencyMs -
+          b.latencyMs
+        );
+      }
 
-      const ai = pos.has(a.name)
-        ? pos.get(a.name)
+      const ai = positions.has(a.name)
+        ? positions.get(a.name)
         : Number.MAX_SAFE_INTEGER;
 
-      const bi = pos.has(b.name)
-        ? pos.get(b.name)
+      const bi = positions.has(b.name)
+        ? positions.get(b.name)
         : Number.MAX_SAFE_INTEGER;
 
-      if (ai !== bi)
+      if (ai !== bi) {
         return ai - bi;
+      }
 
-      return utf8cmp(a.name, b.name);
+      return utf8Compare(
+        a.name,
+        b.name
+      );
     });
 
     selected = admitted[0].name;
 
+    /*
+     * EXACT recorded winner object.
+     */
     packageManifest =
-      storedByName.get(selected) || null;
+      storedByName.get(selected) ||
+      null;
   }
 
   return res.status(200).json({
@@ -707,23 +990,28 @@ function select(body, res) {
   });
 }
 
-/* ============================================================
-   ROUTES
-   ============================================================ */
-
+/*
+ * POST /quantize
+ */
 app.post("/quantize", (req, res) => {
-  if (!isObj(req.body))
+  if (!isObj(req.body)) {
     return invalid(res);
+  }
 
-  if (req.body.phase === "freeze")
+  if (req.body.phase === "freeze") {
     return freeze(req.body, res);
+  }
 
-  if (req.body.phase === "select")
+  if (req.body.phase === "select") {
     return select(req.body, res);
+  }
 
   return invalid(res);
 });
 
+/*
+ * Health endpoints.
+ */
 app.get("/", (req, res) => {
   res.json({ status: "ok" });
 });
@@ -732,8 +1020,15 @@ app.get("/health", (req, res) => {
   res.json({ status: "ok" });
 });
 
-const PORT = process.env.PORT || 10000;
+const PORT =
+  process.env.PORT || 10000;
 
-app.listen(PORT, "0.0.0.0", () => {
-  console.log(`Quantize service listening on ${PORT}`);
-});
+app.listen(
+  PORT,
+  "0.0.0.0",
+  () => {
+    console.log(
+      `Quantize service listening on ${PORT}`
+    );
+  }
+);
