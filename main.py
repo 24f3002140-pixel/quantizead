@@ -703,7 +703,6 @@ async def quantize(request: Request):
             return error_response("INVALID_INPUT", 400)
         return do_freeze(body)
 
-    # SELECT phase
     candidates = body.get("candidates")
     rows = body.get("rows")
     policy = body.get("policy")
