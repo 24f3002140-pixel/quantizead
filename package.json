@@ -1,6 +1,7 @@
 {
-  "name": "quantize-service",
+  "name": "quantizead",
   "version": "1.0.0",
+  "description": "Quantize and admit model API",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
